@@ -20,6 +20,6 @@ from django.urls import path, include
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('api/', include('nivara_app.urls')),  # ✅ All APIs under /api/
+    path('', include('nivara_app.urls')),  # ✅ Direct access without /api/ prefix
 ]
 

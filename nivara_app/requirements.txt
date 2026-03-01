@@ -1,4 +1,10 @@
-pip install textblob
-python -m textblob.download_corpora
-pip install djangorestframework
-pip install djangorestframework-simplejwt
+﻿Django==4.2
+djangorestframework==3.14.0
+djangorestframework-simplejwt==5.3.0
+django-cors-headers==4.3.1
+python-decouple==3.8
+numpy
+pandas
+plotly
+nltk
+textblob
