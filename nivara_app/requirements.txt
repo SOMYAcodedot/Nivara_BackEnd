@@ -1,0 +1,4 @@
+pip install textblob
+python -m textblob.download_corpora
+pip install djangorestframework
+pip install djangorestframework-simplejwt
