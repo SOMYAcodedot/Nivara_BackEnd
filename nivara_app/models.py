@@ -2,6 +2,7 @@ from django.db import models
 from django.contrib.auth.models import AbstractUser
 
 # Added Comments for clarity and alignment with views.py and AI Engine logic
+# added comment for check
 
 # =========================================================
 # 👤 CUSTOM USER MODEL
