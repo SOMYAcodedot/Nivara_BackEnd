@@ -6,6 +6,12 @@ from .views import (
     log_mood,
     mood_history,
     run_mood_analysis,
+    # Phase 2: Mood Analytics APIs
+    mood_trend_data,
+    emotion_distribution,
+    stress_pattern_data,
+    mood_analytics_summary,
+    mood_history_detailed,
     log_cycle,              # ✅ corrected
     predict_cycle_view,
     lifestyle_plan,
@@ -32,6 +38,15 @@ urlpatterns = [
     path("mood/log/", log_mood, name="log_mood"),
     path("mood/history/", mood_history, name="mood_history"),
     path("mood/analysis/", run_mood_analysis, name="mood_analysis"),
+
+    # ===============================
+    # 📊 PHASE 2: MOOD ANALYTICS (Graphical Data)
+    # ===============================
+    path("mood/trend/", mood_trend_data, name="mood_trend"),
+    path("mood/emotions/", emotion_distribution, name="emotion_distribution"),
+    path("mood/stress/", stress_pattern_data, name="stress_pattern"),
+    path("mood/summary/", mood_analytics_summary, name="mood_summary"),
+    path("mood/history/detailed/", mood_history_detailed, name="mood_history_detailed"),
 
     # ===============================
     # 🤖 AI CHATBOT

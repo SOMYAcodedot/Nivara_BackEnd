@@ -21,11 +21,25 @@ class SignupSerializer(serializers.ModelSerializer):
         return user
 
 
-# ✅ Mood Entry Serializer
+# ✅ Mood Entry Serializer (Phase 2 Enhanced)
 class MoodEntrySerializer(serializers.ModelSerializer):
     class Meta:
         model = MoodEntry
+        fields = ['id', 'mood_score', 'emotion_type', 'journal_text', 'entry_date', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+    def validate_mood_score(self, value):
+        if value < 1 or value > 10:
+            raise serializers.ValidationError("Mood score must be between 1 and 10")
+        return value
+
+
+# ✅ Mood Entry List Serializer (For history view with all fields)
+class MoodEntryDetailSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MoodEntry
         fields = '__all__'
+        read_only_fields = ['id', 'user', 'created_at']
 
 
 # ✅ Cycle Entry Serializer

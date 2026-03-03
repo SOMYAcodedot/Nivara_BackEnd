@@ -1,5 +1,6 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser
+from datetime import date
 
 # Added Comments for clarity and alignment with views.py and AI Engine logic
 # added comment for check
@@ -34,22 +35,44 @@ class User(AbstractUser):
 
 # =========================================================
 # 🌸 MOOD ENTRY (Aligned with views.py + AI Engine)
+# Phase 2: Enhanced Mood Logging & Emotional Intelligence
 # =========================================================
 
 class MoodEntry(models.Model):
+    EMOTION_CHOICES = [
+        ('happy', 'Happy'),
+        ('calm', 'Calm'),
+        ('anxious', 'Anxious'),
+        ('sad', 'Sad'),
+        ('irritated', 'Irritated'),
+        ('stressed', 'Stressed'),
+        ('excited', 'Excited'),
+        ('tired', 'Tired'),
+        ('neutral', 'Neutral'),
+        ('hopeful', 'Hopeful'),
+        ('overwhelmed', 'Overwhelmed'),
+        ('content', 'Content'),
+    ]
+
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="mood_entries")
 
-    mood_text = models.TextField()
-    mood_rating = models.IntegerField(null=True, blank=True)  # 1-5 scale
+    mood_score = models.IntegerField(default=5)  # 1-10 scale
+    emotion_type = models.CharField(max_length=20, choices=EMOTION_CHOICES, default='neutral')
+    journal_text = models.TextField(blank=True, null=True)  # Optional journal entry
+    entry_date = models.DateField(default=date.today)  # Date of mood entry
+
+    # Legacy fields for backward compatibility
+    mood_text = models.TextField(blank=True, null=True)
+    mood_rating = models.IntegerField(null=True, blank=True)  # Legacy 1-5 scale
 
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        ordering = ["-created_at"]
+        ordering = ["-entry_date", "-created_at"]
         db_table = "mood_entries"
 
     def __str__(self):
-        return f"{self.user.username} - {self.mood_rating}"
+        return f"{self.user.username} - {self.mood_score}/10 - {self.emotion_type}"
 
 
 # =========================================================

@@ -158,8 +158,8 @@ REST_FRAMEWORK = {
 
 # JWT Settings
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=60),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=1),
+    'ACCESS_TOKEN_LIFETIME': timedelta(days=30),  # Increased for development/testing
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=90),  # Increased for longer session
 }
 
 # Timezone (update existing)
