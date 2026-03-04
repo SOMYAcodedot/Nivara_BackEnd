@@ -17,7 +17,20 @@ from .views import (
     lifestyle_plan,
     generate_report,
     chat_with_ai,
-    DashboardView
+    DashboardView,
+    # Phase 3: Cycle Intelligence APIs
+    CycleProfileView,
+    PeriodLogView,
+    PeriodLogDetailView,
+    DailyCheckinView,
+    TodayCheckinView,
+    CycleStatusView,
+    CycleDashboardView,
+    CycleInsightsView,
+    CycleIrregularityView,
+    CycleCalendarView,
+    OnboardingStatusView,
+    cycle_options,
 )
 
 from rest_framework_simplejwt.views import TokenRefreshView
@@ -54,10 +67,36 @@ urlpatterns = [
     path("chat/", chat_with_ai, name="chat_with_ai"),
 
     # ===============================
-    # 🌸 CYCLE INTELLIGENCE
+    # 🌸 CYCLE INTELLIGENCE (Legacy)
     # ===============================
     path("cycle/log/", log_cycle, name="log_cycle"),
     path("cycle/predict/", predict_cycle_view, name="cycle_prediction"),
+
+    # ===============================
+    # 🌸 PHASE 3: CYCLE INTELLIGENCE LAYER
+    # ===============================
+    
+    # Cycle Profile (Onboarding)
+    path("cycle/profile/", CycleProfileView.as_view(), name="cycle_profile"),
+    path("cycle/onboarding-status/", OnboardingStatusView.as_view(), name="onboarding_status"),
+    path("cycle/options/", cycle_options, name="cycle_options"),
+    
+    # Period Logging
+    path("cycle/period/", PeriodLogView.as_view(), name="period_log"),
+    path("cycle/period/<int:log_id>/", PeriodLogDetailView.as_view(), name="period_log_detail"),
+    
+    # Daily Checkin
+    path("cycle/checkin/", DailyCheckinView.as_view(), name="daily_checkin"),
+    path("cycle/checkin/today/", TodayCheckinView.as_view(), name="today_checkin"),
+    
+    # Cycle Status & Dashboard
+    path("cycle/status/", CycleStatusView.as_view(), name="cycle_status"),
+    path("cycle/dashboard/", CycleDashboardView.as_view(), name="cycle_dashboard"),
+    
+    # Cycle Insights & Analysis
+    path("cycle/insights/", CycleInsightsView.as_view(), name="cycle_insights"),
+    path("cycle/irregularity/", CycleIrregularityView.as_view(), name="cycle_irregularity"),
+    path("cycle/calendar/", CycleCalendarView.as_view(), name="cycle_calendar"),
 
     # ===============================
     # 🥗 LIFESTYLE AI

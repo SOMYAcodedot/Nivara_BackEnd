@@ -12,17 +12,36 @@ from django.db.models.functions import TruncDate, TruncWeek
 from collections import Counter
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
-from .models import MoodEntry, CycleEntry
-from .serializers import MoodEntrySerializer, MoodEntryDetailSerializer, CycleEntrySerializer
+from .models import MoodEntry, CycleEntry, CycleProfile, PeriodLog, DailyCheckin
+from .serializers import (
+    MoodEntrySerializer, 
+    MoodEntryDetailSerializer, 
+    CycleEntrySerializer,
+    CycleProfileSerializer,
+    CycleProfileCreateSerializer,
+    PeriodLogSerializer,
+    PeriodLogCreateSerializer,
+    PeriodLogUpdateSerializer,
+    DailyCheckinSerializer,
+    DailyCheckinCreateSerializer
+)
 
 User = get_user_model()
 
 # AI ENGINE IMPORTS
 from .ai_engine.mood_analysis import analyze_mood_entries
 from .ai_engine.chatbot_engine import chatbot_response
-from .ai_engine.cycle_logic import predict_cycle
+from .ai_engine.cycle_logic import (
+    predict_cycle, 
+    get_cycle_status, 
+    get_full_cycle_dashboard,
+    calculate_cycle_day,
+    get_cycle_phase,
+    detect_irregularity,
+    generate_personalized_insights
+)
 from .ai_engine.lifestyle_ai import generate_lifestyle_plan
 from .ai_engine.report_generator import generate_health_report
 
@@ -582,3 +601,732 @@ class DashboardView(APIView):
         return Response({
             "message": "Welcome to Nivara Women’s Health AI System"
         })
+
+# =========================================================
+# 🌸 PHASE 3: CYCLE INTELLIGENCE LAYER APIs
+# =========================================================
+
+# =========================================================
+# 📋 CYCLE PROFILE (Onboarding)
+# =========================================================
+
+class CycleProfileView(APIView):
+    """
+    API for managing user's cycle profile (onboarding data).
+    GET: Retrieve current profile
+    POST: Create new profile (onboarding)
+    PUT/PATCH: Update existing profile
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        """Get user's cycle profile."""
+        try:
+            profile = CycleProfile.objects.get(user=request.user)
+            serializer = CycleProfileSerializer(profile)
+            return Response({
+                "has_profile": True,
+                "is_onboarding_complete": profile.is_onboarding_complete,
+                "profile": serializer.data
+            })
+        except CycleProfile.DoesNotExist:
+            return Response({
+                "has_profile": False,
+                "is_onboarding_complete": False,
+                "message": "No cycle profile found. Please complete onboarding."
+            })
+    
+    def post(self, request):
+        """Create cycle profile during onboarding."""
+        # Check if profile already exists
+        if CycleProfile.objects.filter(user=request.user).exists():
+            return Response({
+                "error": "Profile already exists. Use PUT to update."
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        serializer = CycleProfileCreateSerializer(data=request.data)
+        if serializer.is_valid():
+            profile = serializer.save(user=request.user)
+            
+            # Also create initial period log from the last period date
+            PeriodLog.objects.create(
+                user=request.user,
+                period_start_date=profile.last_period_start_date,
+                flow_intensity=profile.flow_intensity_last_period
+            )
+            
+            return Response({
+                "message": "Cycle profile created successfully",
+                "profile": CycleProfileSerializer(profile).data
+            }, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    def put(self, request):
+        """Update entire cycle profile."""
+        try:
+            profile = CycleProfile.objects.get(user=request.user)
+        except CycleProfile.DoesNotExist:
+            return Response({
+                "error": "No profile found. Use POST to create."
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        serializer = CycleProfileSerializer(profile, data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response({
+                "message": "Profile updated successfully",
+                "profile": serializer.data
+            })
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    def patch(self, request):
+        """Partially update cycle profile."""
+        try:
+            profile = CycleProfile.objects.get(user=request.user)
+        except CycleProfile.DoesNotExist:
+            return Response({
+                "error": "No profile found. Use POST to create."
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        serializer = CycleProfileSerializer(profile, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response({
+                "message": "Profile updated successfully",
+                "profile": serializer.data
+            })
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+# =========================================================
+# 📅 PERIOD LOGGING
+# =========================================================
+
+class PeriodLogView(APIView):
+    """
+    API for logging periods.
+    GET: List all period logs
+    POST: Log a new period
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        """Get all period logs for user."""
+        logs = PeriodLog.objects.filter(user=request.user).order_by('-period_start_date')
+        serializer = PeriodLogSerializer(logs, many=True)
+        
+        return Response({
+            "count": logs.count(),
+            "period_logs": serializer.data
+        })
+    
+    def post(self, request):
+        """Log a new period."""
+        serializer = PeriodLogCreateSerializer(data=request.data)
+        if serializer.is_valid():
+            period_log = serializer.save(user=request.user)
+            
+            # Update cycle profile's last period date
+            try:
+                profile = CycleProfile.objects.get(user=request.user)
+                if period_log.period_start_date > profile.last_period_start_date:
+                    profile.last_period_start_date = period_log.period_start_date
+                    if period_log.flow_intensity:
+                        profile.flow_intensity_last_period = period_log.flow_intensity
+                    profile.save()
+            except CycleProfile.DoesNotExist:
+                pass
+            
+            return Response({
+                "message": "Period logged successfully",
+                "period_log": PeriodLogSerializer(period_log).data
+            }, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class PeriodLogDetailView(APIView):
+    """
+    API for managing individual period log entries.
+    GET: Get specific period log
+    PUT: Update period log (e.g., add end date)
+    DELETE: Remove period log
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request, log_id):
+        """Get specific period log."""
+        try:
+            log = PeriodLog.objects.get(id=log_id, user=request.user)
+            serializer = PeriodLogSerializer(log)
+            return Response(serializer.data)
+        except PeriodLog.DoesNotExist:
+            return Response({
+                "error": "Period log not found"
+            }, status=status.HTTP_404_NOT_FOUND)
+    
+    def put(self, request, log_id):
+        """Update period log."""
+        try:
+            log = PeriodLog.objects.get(id=log_id, user=request.user)
+        except PeriodLog.DoesNotExist:
+            return Response({
+                "error": "Period log not found"
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        serializer = PeriodLogUpdateSerializer(log, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response({
+                "message": "Period log updated successfully",
+                "period_log": PeriodLogSerializer(log).data
+            })
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    def delete(self, request, log_id):
+        """Delete period log."""
+        try:
+            log = PeriodLog.objects.get(id=log_id, user=request.user)
+            log.delete()
+            return Response({
+                "message": "Period log deleted successfully"
+            }, status=status.HTTP_204_NO_CONTENT)
+        except PeriodLog.DoesNotExist:
+            return Response({
+                "error": "Period log not found"
+            }, status=status.HTTP_404_NOT_FOUND)
+
+
+# =========================================================
+# 📝 DAILY CHECKIN
+# =========================================================
+
+class DailyCheckinView(APIView):
+    """
+    API for daily symptom and mood checkins.
+    GET: Get checkins (with optional date filter)
+    POST: Create or update today's checkin
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        """Get daily checkins."""
+        days = int(request.query_params.get('days', 30))
+        start_date = date.today() - timedelta(days=days)
+        
+        checkins = DailyCheckin.objects.filter(
+            user=request.user,
+            checkin_date__gte=start_date
+        ).order_by('-checkin_date')
+        
+        serializer = DailyCheckinSerializer(checkins, many=True)
+        
+        return Response({
+            "period_days": days,
+            "count": checkins.count(),
+            "checkins": serializer.data
+        })
+    
+    def post(self, request):
+        """Create or update today's checkin."""
+        checkin_date = request.data.get('checkin_date', date.today())
+        if isinstance(checkin_date, str):
+            checkin_date = datetime.strptime(checkin_date, "%Y-%m-%d").date()
+        
+        # Check if checkin already exists for this date
+        existing = DailyCheckin.objects.filter(
+            user=request.user,
+            checkin_date=checkin_date
+        ).first()
+        
+        if existing:
+            # Update existing checkin
+            serializer = DailyCheckinCreateSerializer(existing, data=request.data, partial=True)
+            message = "Checkin updated successfully"
+        else:
+            # Create new checkin
+            serializer = DailyCheckinCreateSerializer(data=request.data)
+            message = "Checkin created successfully"
+        
+        if serializer.is_valid():
+            checkin = serializer.save(user=request.user)
+            
+            # Calculate and set cycle day/phase
+            try:
+                profile = CycleProfile.objects.get(user=request.user)
+                cycle_day = calculate_cycle_day(profile.last_period_start_date, checkin_date)
+                phase_info = get_cycle_phase(
+                    cycle_day, 
+                    profile.average_cycle_length_days,
+                    profile.average_period_length_days
+                )
+                checkin.cycle_day = cycle_day
+                checkin.cycle_phase = phase_info['phase']
+                checkin.save()
+            except CycleProfile.DoesNotExist:
+                pass
+            
+            return Response({
+                "message": message,
+                "checkin": DailyCheckinSerializer(checkin).data
+            }, status=status.HTTP_201_CREATED if not existing else status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class TodayCheckinView(APIView):
+    """
+    API to get today's checkin specifically.
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        """Get today's checkin if exists."""
+        today = date.today()
+        try:
+            checkin = DailyCheckin.objects.get(user=request.user, checkin_date=today)
+            return Response({
+                "has_checkin_today": True,
+                "checkin": DailyCheckinSerializer(checkin).data
+            })
+        except DailyCheckin.DoesNotExist:
+            return Response({
+                "has_checkin_today": False,
+                "message": "No checkin recorded for today"
+            })
+
+
+# =========================================================
+# 📊 CYCLE STATUS & DASHBOARD
+# =========================================================
+
+class CycleStatusView(APIView):
+    """
+    API to get current cycle status.
+    Returns calculated cycle day, phase, predictions, etc.
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        """Get current cycle status."""
+        try:
+            profile = CycleProfile.objects.get(user=request.user)
+        except CycleProfile.DoesNotExist:
+            return Response({
+                "error": "No cycle profile found. Please complete onboarding first.",
+                "has_profile": False
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        status_data = get_cycle_status(
+            profile.last_period_start_date,
+            profile.average_cycle_length_days,
+            profile.average_period_length_days
+        )
+        
+        return Response({
+            "has_profile": True,
+            "current_cycle_status": status_data
+        })
+
+
+class CycleDashboardView(APIView):
+    """
+    Comprehensive cycle dashboard API.
+    Returns the full JSON structure as specified in requirements.
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        """Get full cycle dashboard data."""
+        try:
+            profile = CycleProfile.objects.get(user=request.user)
+        except CycleProfile.DoesNotExist:
+            return Response({
+                "error": "No cycle profile found. Please complete onboarding first.",
+                "has_profile": False,
+                "onboarding_required": True
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Prepare profile data dict
+        profile_data = {
+            'last_period_start_date': profile.last_period_start_date,
+            'average_cycle_length_days': profile.average_cycle_length_days,
+            'average_period_length_days': profile.average_period_length_days,
+            'cycle_regularity': profile.cycle_regularity,
+            'flow_intensity_last_period': profile.flow_intensity_last_period,
+            'spotting_between_periods': profile.spotting_between_periods,
+            'typical_pms_symptoms': profile.typical_pms_symptoms,
+            'birth_control_status': profile.birth_control_status,
+            'reproductive_status': profile.reproductive_status
+        }
+        
+        # Get recent checkin
+        recent_checkin = None
+        try:
+            latest_checkin = DailyCheckin.objects.filter(user=request.user).order_by('-checkin_date').first()
+            if latest_checkin:
+                recent_checkin = {
+                    'mood': latest_checkin.mood,
+                    'energy_level': latest_checkin.energy_level,
+                    'physical_symptoms': latest_checkin.physical_symptoms,
+                    'user_notes': latest_checkin.user_notes,
+                    'checkin_date': latest_checkin.checkin_date.strftime('%Y-%m-%d')
+                }
+        except:
+            pass
+        
+        # Get mood summary for insights
+        mood_summary = None
+        try:
+            moods = MoodEntry.objects.filter(
+                user=request.user,
+                entry_date__gte=date.today() - timedelta(days=7)
+            )
+            if moods.exists():
+                analysis = analyze_mood_entries(moods)
+                mood_summary = analysis
+        except:
+            pass
+        
+        # Get period logs for irregularity analysis
+        period_logs = list(PeriodLog.objects.filter(user=request.user).values(
+            'period_start_date', 
+            'period_end_date', 
+            'cycle_length_from_previous',
+            'actual_period_length'
+        ))
+        
+        # Generate full dashboard
+        dashboard = get_full_cycle_dashboard(
+            profile_data,
+            recent_checkin,
+            mood_summary,
+            period_logs if len(period_logs) >= 2 else None
+        )
+        
+        return Response(dashboard)
+
+
+# =========================================================
+# 🧠 CYCLE INSIGHTS & PREDICTIONS
+# =========================================================
+
+class CycleInsightsView(APIView):
+    """
+    API for personalized cycle insights.
+    Connects hormonal state with emotional patterns.
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        """Get personalized cycle insights."""
+        try:
+            profile = CycleProfile.objects.get(user=request.user)
+        except CycleProfile.DoesNotExist:
+            return Response({
+                "error": "No cycle profile found"
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Get current cycle status
+        cycle_status = get_cycle_status(
+            profile.last_period_start_date,
+            profile.average_cycle_length_days,
+            profile.average_period_length_days
+        )
+        
+        # Get mood data
+        mood_data = None
+        moods = MoodEntry.objects.filter(
+            user=request.user,
+            entry_date__gte=date.today() - timedelta(days=7)
+        )
+        if moods.exists():
+            mood_data = analyze_mood_entries(moods)
+        
+        # Get recent checkin
+        checkin_data = None
+        latest_checkin = DailyCheckin.objects.filter(user=request.user).order_by('-checkin_date').first()
+        if latest_checkin:
+            checkin_data = {
+                'mood': latest_checkin.mood,
+                'energy_level': latest_checkin.energy_level,
+                'physical_symptoms': latest_checkin.physical_symptoms
+            }
+        
+        # Generate insights
+        insights = generate_personalized_insights(cycle_status, mood_data, checkin_data)
+        
+        return Response({
+            "cycle_status": cycle_status,
+            "insights": insights
+        })
+
+
+class CycleIrregularityView(APIView):
+    """
+    API to check for cycle irregularities.
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        """Analyze cycle irregularities."""
+        try:
+            profile = CycleProfile.objects.get(user=request.user)
+        except CycleProfile.DoesNotExist:
+            return Response({
+                "error": "No cycle profile found"
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Get period logs
+        period_logs = list(PeriodLog.objects.filter(user=request.user).values(
+            'period_start_date',
+            'cycle_length_from_previous',
+            'actual_period_length'
+        ))
+        
+        if len(period_logs) < 2:
+            return Response({
+                "has_sufficient_data": False,
+                "message": "Need at least 2 period records for irregularity analysis",
+                "periods_logged": len(period_logs)
+            })
+        
+        analysis = detect_irregularity(period_logs, profile.average_cycle_length_days)
+        
+        return Response({
+            "has_sufficient_data": True,
+            "analysis": analysis
+        })
+
+
+# =========================================================
+# 🌸 CYCLE CALENDAR DATA
+# =========================================================
+
+class CycleCalendarView(APIView):
+    """
+    API to get cycle data for calendar visualization.
+    Returns period days, fertile windows, and predictions for a given month.
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        """Get calendar data for cycle visualization."""
+        # Get month/year from params (default to current month)
+        year = int(request.query_params.get('year', date.today().year))
+        month = int(request.query_params.get('month', date.today().month))
+        
+        try:
+            profile = CycleProfile.objects.get(user=request.user)
+        except CycleProfile.DoesNotExist:
+            return Response({
+                "error": "No cycle profile found"
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Get actual period logs for this time range
+        start_of_month = date(year, month, 1)
+        if month == 12:
+            end_of_month = date(year + 1, 1, 1) - timedelta(days=1)
+        else:
+            end_of_month = date(year, month + 1, 1) - timedelta(days=1)
+        
+        period_logs = PeriodLog.objects.filter(
+            user=request.user,
+            period_start_date__lte=end_of_month,
+        ).filter(
+            # Either period starts in this month or extends into it
+            period_start_date__gte=start_of_month - timedelta(days=10)
+        )
+        
+        # Build calendar data
+        calendar_data = {
+            "year": year,
+            "month": month,
+            "period_days": [],
+            "predicted_period_days": [],
+            "fertile_days": [],
+            "ovulation_days": [],
+            "pms_days": []
+        }
+        
+        # Add actual logged period days
+        for log in period_logs:
+            start = log.period_start_date
+            end = log.period_end_date or (start + timedelta(days=profile.average_period_length_days - 1))
+            
+            current = start
+            while current <= end:
+                if start_of_month <= current <= end_of_month:
+                    calendar_data["period_days"].append(current.strftime("%Y-%m-%d"))
+                current += timedelta(days=1)
+        
+        # Calculate predictions
+        last_period = profile.last_period_start_date
+        cycle_length = profile.average_cycle_length_days
+        period_length = profile.average_period_length_days
+        
+        # Generate predictions for this month
+        predicted_period = last_period
+        while predicted_period < end_of_month:
+            predicted_period = predicted_period + timedelta(days=cycle_length)
+            
+            if predicted_period >= start_of_month and predicted_period <= end_of_month:
+                # Add predicted period days
+                for i in range(period_length):
+                    day = predicted_period + timedelta(days=i)
+                    if start_of_month <= day <= end_of_month:
+                        day_str = day.strftime("%Y-%m-%d")
+                        if day_str not in calendar_data["period_days"]:
+                            calendar_data["predicted_period_days"].append(day_str)
+                
+                # Add ovulation day (14 days before next predicted period)
+                ovulation = predicted_period - timedelta(days=14)
+                if start_of_month <= ovulation <= end_of_month:
+                    calendar_data["ovulation_days"].append(ovulation.strftime("%Y-%m-%d"))
+                
+                # Add fertile window (5 days before ovulation + ovulation)
+                for i in range(6):
+                    fertile_day = ovulation - timedelta(days=5-i)
+                    if start_of_month <= fertile_day <= end_of_month:
+                        calendar_data["fertile_days"].append(fertile_day.strftime("%Y-%m-%d"))
+                
+                # Add PMS days (7 days before period)
+                for i in range(7):
+                    pms_day = predicted_period - timedelta(days=i+1)
+                    if start_of_month <= pms_day <= end_of_month:
+                        calendar_data["pms_days"].append(pms_day.strftime("%Y-%m-%d"))
+        
+        return Response(calendar_data)
+
+
+# =========================================================
+# 🎯 ONBOARDING STATUS CHECK
+# =========================================================
+
+class OnboardingStatusView(APIView):
+    """
+    API to check if user has completed cycle onboarding.
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        """Check onboarding status."""
+        try:
+            profile = CycleProfile.objects.get(user=request.user)
+            return Response({
+                "has_profile": True,
+                "is_onboarding_complete": profile.is_onboarding_complete,
+                "profile_created_at": profile.created_at,
+                "last_updated": profile.updated_at
+            })
+        except CycleProfile.DoesNotExist:
+            return Response({
+                "has_profile": False,
+                "is_onboarding_complete": False,
+                "message": "User needs to complete cycle setup onboarding"
+            })
+
+
+# =========================================================
+# 📋 CYCLE OPTIONS (For Frontend Dropdowns)
+# =========================================================
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def cycle_options(request):
+    """
+    Returns all available options for cycle-related dropdowns.
+    Useful for frontend form building.
+    """
+    return Response({
+        "cycle_length_options": [
+            {"value": "21-24", "label": "21-24 days"},
+            {"value": "25-28", "label": "25-28 days"},
+            {"value": "29-32", "label": "29-32 days"},
+            {"value": "33-35", "label": "33-35 days"},
+            {"value": "35+", "label": "More than 35 days"},
+            {"value": "not_sure", "label": "Not sure"}
+        ],
+        "period_length_options": [
+            {"value": "2-3", "label": "2-3 days"},
+            {"value": "3-4", "label": "3-4 days"},
+            {"value": "5-6", "label": "5-6 days"},
+            {"value": "7+", "label": "7+ days"},
+            {"value": "not_sure", "label": "Not sure"}
+        ],
+        "regularity_options": [
+            {"value": "mostly_regular", "label": "Yes, mostly regular"},
+            {"value": "sometimes_irregular", "label": "Sometimes irregular"},
+            {"value": "very_unpredictable", "label": "Very unpredictable"},
+            {"value": "not_sure", "label": "Not sure"}
+        ],
+        "flow_intensity_options": [
+            {"value": "light", "label": "Light"},
+            {"value": "moderate", "label": "Moderate"},
+            {"value": "heavy", "label": "Heavy"},
+            {"value": "very_heavy", "label": "Very heavy"},
+            {"value": "not_sure", "label": "Not sure"}
+        ],
+        "spotting_options": [
+            {"value": "never", "label": "Never"},
+            {"value": "occasionally", "label": "Occasionally"},
+            {"value": "frequently", "label": "Frequently"},
+            {"value": "not_sure", "label": "Not sure"}
+        ],
+        "pms_symptom_options": [
+            {"value": "mood_swings", "label": "Mood swings"},
+            {"value": "irritability", "label": "Irritability"},
+            {"value": "anxiety", "label": "Anxiety"},
+            {"value": "low_mood", "label": "Low mood"},
+            {"value": "bloating", "label": "Bloating"},
+            {"value": "breast_tenderness", "label": "Breast tenderness"},
+            {"value": "headache", "label": "Headache"},
+            {"value": "fatigue", "label": "Fatigue"},
+            {"value": "cramps", "label": "Cramps"},
+            {"value": "acne", "label": "Acne"},
+            {"value": "sleep_disturbance", "label": "Sleep disturbance"},
+            {"value": "no_symptoms", "label": "No noticeable symptoms"},
+            {"value": "not_sure", "label": "Not sure"}
+        ],
+        "birth_control_options": [
+            {"value": "no", "label": "No"},
+            {"value": "pill", "label": "Yes – Pill"},
+            {"value": "hormonal_iud", "label": "Yes – Hormonal IUD"},
+            {"value": "copper_iud", "label": "Yes – Copper IUD"},
+            {"value": "patch_ring", "label": "Yes – Patch / Ring"},
+            {"value": "prefer_not_say", "label": "Prefer not to say"}
+        ],
+        "reproductive_status_options": [
+            {"value": "none", "label": "None"},
+            {"value": "trying_to_conceive", "label": "Trying to conceive"},
+            {"value": "pregnant", "label": "Pregnant"},
+            {"value": "postpartum", "label": "Postpartum"},
+            {"value": "prefer_not_say", "label": "Prefer not to say"}
+        ],
+        "mood_options": [
+            {"value": "calm", "label": "Calm"},
+            {"value": "happy", "label": "Happy"},
+            {"value": "irritated", "label": "Irritated"},
+            {"value": "anxious", "label": "Anxious"},
+            {"value": "emotional", "label": "Emotional"},
+            {"value": "low", "label": "Low"},
+            {"value": "motivated", "label": "Motivated"},
+            {"value": "overwhelmed", "label": "Overwhelmed"}
+        ],
+        "energy_level_options": [
+            {"value": "very_low", "label": "Very low"},
+            {"value": "low", "label": "Low"},
+            {"value": "moderate", "label": "Moderate"},
+            {"value": "high", "label": "High"}
+        ],
+        "physical_symptom_options": [
+            {"value": "cramps", "label": "Cramps"},
+            {"value": "headache", "label": "Headache"},
+            {"value": "bloating", "label": "Bloating"},
+            {"value": "breast_tenderness", "label": "Breast tenderness"},
+            {"value": "fatigue", "label": "Fatigue"},
+            {"value": "acne", "label": "Acne"},
+            {"value": "back_pain", "label": "Back pain"},
+            {"value": "nausea", "label": "Nausea"},
+            {"value": "no_symptoms", "label": "No symptoms"}
+        ]
+    })
