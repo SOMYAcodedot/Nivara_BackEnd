@@ -25,7 +25,10 @@ from .serializers import (
     PeriodLogCreateSerializer,
     PeriodLogUpdateSerializer,
     DailyCheckinSerializer,
-    DailyCheckinCreateSerializer
+    DailyCheckinCreateSerializer,
+    UserProfileSerializer,
+    UserProfileSetupSerializer,
+    UserProfileBasicSerializer
 )
 
 User = get_user_model()
@@ -133,6 +136,90 @@ class LogoutView(APIView):
             # If blacklist is not enabled, still return success
             # Client should remove tokens from localStorage
             return Response({"message": "Logged out successfully"}, status=200)
+
+
+# =========================================================
+# 👤 USER PROFILE (STEP 1 - One-Time Setup)
+# =========================================================
+
+class UserProfileView(APIView):
+    """
+    API for user profile management.
+    GET: Retrieve current user profile
+    PUT/PATCH: Update/setup user profile (STEP 1)
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        """Get current user profile with all details."""
+        serializer = UserProfileSerializer(request.user)
+        return Response({
+            "user_profile": serializer.data
+        })
+    
+    def put(self, request):
+        """Complete initial profile setup (STEP 1)."""
+        serializer = UserProfileSetupSerializer(request.user, data=request.data)
+        if serializer.is_valid():
+            user = serializer.save()
+            
+            return Response({
+                "message": "Profile setup completed successfully",
+                "user_profile": UserProfileSerializer(user).data
+            }, status=status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    
+    def patch(self, request):
+        """Partially update user profile."""
+        serializer = UserProfileSetupSerializer(request.user, data=request.data, partial=True)
+        if serializer.is_valid():
+            user = serializer.save()
+            
+            return Response({
+                "message": "Profile updated successfully",
+                "user_profile": UserProfileSerializer(user).data
+            })
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ProfileStatusView(APIView):
+    """
+    Check if user has completed profile setup.
+    """
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        """Check profile completion status."""
+        user = request.user
+        
+        return Response({
+            "is_profile_complete": user.is_profile_complete,
+            "profile_completed_at": user.profile_completed_at,
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email
+            }
+        })
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def lifestyle_options(request):
+    """
+    Returns lifestyle dropdown options for frontend.
+    """
+    return Response({
+        "lifestyle_options": [
+            {"value": "student", "label": "Student"},
+            {"value": "working", "label": "Working Professional"},
+            {"value": "homemaker", "label": "Homemaker"},
+            {"value": "retired", "label": "Retired"},
+            {"value": "other", "label": "Other"}
+        ]
+    })
 
 
 # =========================================================

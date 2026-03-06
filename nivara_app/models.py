@@ -10,9 +10,30 @@ from datetime import date
 # =========================================================
 
 class User(AbstractUser):
+    LIFESTYLE_CHOICES = [
+        ('student', 'Student'),
+        ('working', 'Working Professional'),
+        ('homemaker', 'Homemaker'),
+        ('retired', 'Retired'),
+        ('other', 'Other'),
+    ]
+    
+    # Basic info
     age = models.IntegerField(null=True, blank=True)
     avg_cycle_length = models.IntegerField(default=28)
     is_female = models.BooleanField(default=True)
+    
+    # Extended profile (STEP 1 - One-Time Setup)
+    height = models.FloatField(null=True, blank=True, help_text="Height in cm")
+    weight = models.FloatField(null=True, blank=True, help_text="Weight in kg")
+    sleep_average = models.IntegerField(null=True, blank=True, help_text="Average sleep quality 1-10")
+    energy_average = models.IntegerField(null=True, blank=True, help_text="Average energy level 1-10")
+    anxiety_average = models.IntegerField(null=True, blank=True, help_text="Average anxiety level 1-10")
+    lifestyle = models.CharField(max_length=20, choices=LIFESTYLE_CHOICES, null=True, blank=True)
+    
+    # Profile completion tracking
+    is_profile_complete = models.BooleanField(default=False)
+    profile_completed_at = models.DateTimeField(null=True, blank=True)
 
     groups = models.ManyToManyField(
         'auth.Group',
@@ -31,6 +52,29 @@ class User(AbstractUser):
 
     def __str__(self):
         return self.username
+    
+    def calculate_bmi(self):
+        """Calculate BMI if height and weight are available."""
+        if self.height and self.weight:
+            height_m = self.height / 100  # Convert cm to meters
+            bmi = self.weight / (height_m ** 2)
+            return round(bmi, 2)
+        return None
+    
+    def get_bmi_category(self):
+        """Get BMI category."""
+        bmi = self.calculate_bmi()
+        if not bmi:
+            return None
+        
+        if bmi < 18.5:
+            return "Underweight"
+        elif 18.5 <= bmi < 25:
+            return "Normal weight"
+        elif 25 <= bmi < 30:
+            return "Overweight"
+        else:
+            return "Obese"
 
 
 # =========================================================

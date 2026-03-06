@@ -3,6 +3,9 @@ from .views import (
     SignupView,
     LoginView,
     LogoutView,
+    UserProfileView,
+    ProfileStatusView,
+    lifestyle_options,
     log_mood,
     mood_history,
     run_mood_analysis,
@@ -44,6 +47,13 @@ urlpatterns = [
     path("auth/login/", LoginView.as_view(), name="login"),
     path("auth/logout/", LogoutView.as_view(), name="logout"),
     path("auth/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
+
+    # ===============================
+    # 👤 USER PROFILE (STEP 1 - One-Time Setup)
+    # ===============================
+    path("user/profile/", UserProfileView.as_view(), name="user_profile"),
+    path("user/profile-status/", ProfileStatusView.as_view(), name="profile_status"),
+    path("user/lifestyle-options/", lifestyle_options, name="lifestyle_options"),
 
     # ===============================
     # 🧠 MOOD MODULE

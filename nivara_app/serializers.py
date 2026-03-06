@@ -21,6 +21,116 @@ class SignupSerializer(serializers.ModelSerializer):
         return user
 
 
+# =========================================================
+# 👤 USER PROFILE SERIALIZERS (STEP 1 - One-Time Setup)
+# =========================================================
+
+class UserProfileSerializer(serializers.ModelSerializer):
+    """
+    Serializer for user profile with extended health/lifestyle data.
+    """
+    bmi = serializers.SerializerMethodField()
+    bmi_category = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = User
+        fields = [
+            'id',
+            'username',
+            'email',
+            'age',
+            'height',
+            'weight',
+            'bmi',
+            'bmi_category',
+            'sleep_average',
+            'energy_average',
+            'anxiety_average',
+            'lifestyle',
+            'is_profile_complete',
+            'profile_completed_at',
+            'avg_cycle_length',
+            'is_female'
+        ]
+        read_only_fields = ['id', 'username', 'email', 'bmi', 'bmi_category', 'is_profile_complete', 'profile_completed_at']
+    
+    def get_bmi(self, obj):
+        return obj.calculate_bmi()
+    
+    def get_bmi_category(self, obj):
+        return obj.get_bmi_category()
+
+
+class UserProfileSetupSerializer(serializers.ModelSerializer):
+    """
+    Serializer for initial profile setup (STEP 1).
+    Validates and saves extended user profile data.
+    """
+    class Meta:
+        model = User
+        fields = [
+            'age',
+            'height',
+            'weight',
+            'sleep_average',
+            'energy_average',
+            'anxiety_average',
+            'lifestyle'
+        ]
+    
+    def validate_age(self, value):
+        if value and (value < 10 or value > 100):
+            raise serializers.ValidationError("Age must be between 10 and 100")
+        return value
+    
+    def validate_height(self, value):
+        if value and (value < 100 or value > 250):
+            raise serializers.ValidationError("Height must be between 100cm and 250cm")
+        return value
+    
+    def validate_weight(self, value):
+        if value and (value < 30 or value > 300):
+            raise serializers.ValidationError("Weight must be between 30kg and 300kg")
+        return value
+    
+    def validate_sleep_average(self, value):
+        if value and (value < 1 or value > 10):
+            raise serializers.ValidationError("Sleep average must be between 1 and 10")
+        return value
+    
+    def validate_energy_average(self, value):
+        if value and (value < 1 or value > 10):
+            raise serializers.ValidationError("Energy average must be between 1 and 10")
+        return value
+    
+    def validate_anxiety_average(self, value):
+        if value and (value < 1 or value > 10):
+            raise serializers.ValidationError("Anxiety average must be between 1 and 10")
+        return value
+    
+    def update(self, instance, validated_data):
+        """Update user profile and mark as complete."""
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        
+        # Mark profile as complete
+        instance.is_profile_complete = True
+        from django.utils import timezone
+        instance.profile_completed_at = timezone.now()
+        instance.save()
+        return instance
+
+
+class UserProfileBasicSerializer(serializers.ModelSerializer):
+    """
+    Basic user info serializer for quick responses.
+    """
+    class Meta:
+        model = User
+        fields = ['id', 'username', 'email', 'is_profile_complete']
+        read_only_fields = ['id', 'username', 'email', 'is_profile_complete']
+
+
 # ✅ Mood Entry Serializer (Phase 2 Enhanced)
 class MoodEntrySerializer(serializers.ModelSerializer):
     class Meta:
