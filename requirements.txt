@@ -1,0 +1,2 @@
+# Install in your venv:  pip install -r requirements.txt
+-r nivara_app/requirements.txt
