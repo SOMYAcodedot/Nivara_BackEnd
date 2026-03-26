@@ -4,17 +4,31 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate, get_user_model
+from django.utils import timezone
 from rest_framework import status
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.db.models import Avg, Count, StdDev
 from django.db.models.functions import TruncDate, TruncWeek
+from django.core.cache import cache
 from collections import Counter
 import json
 import re
 from datetime import datetime, timedelta, date
 
-from .models import MoodEntry, CycleEntry, CycleProfile, PeriodLog, DailyCheckin
+from .models import (
+    MoodEntry,
+    CycleEntry,
+    CycleProfile,
+    PeriodLog,
+    DailyCheckin,
+    Hospital,
+    Doctor,
+    DoctorConsultationBooking,
+    Payment,
+    ChatSession,
+    ChatMessage,
+)
 from .serializers import (
     MoodEntrySerializer, 
     MoodEntryDetailSerializer, 
@@ -28,7 +42,15 @@ from .serializers import (
     DailyCheckinCreateSerializer,
     UserProfileSerializer,
     UserProfileSetupSerializer,
-    UserProfileBasicSerializer
+    UserProfileBasicSerializer,
+    HospitalSerializer,
+    DoctorSerializer,
+    DoctorListSerializer,
+    DoctorConsultationBookingSerializer,
+    DoctorConsultationBookingCreateSerializer,
+    PaymentSerializer,
+    PaymentInitiateSerializer,
+    PaymentConfirmSerializer,
 )
 
 User = get_user_model()
@@ -36,6 +58,7 @@ User = get_user_model()
 # AI ENGINE IMPORTS
 from .ai_engine.mood_analysis import analyze_mood_entries
 from .ai_engine.chatbot_engine import chatbot_response
+# generic_chat imports openai — lazy-load inside _nivara_single_llm_turn so runserver works if venv missing openai
 from .ai_engine.cycle_logic import (
     predict_cycle, 
     get_cycle_status, 
@@ -45,8 +68,9 @@ from .ai_engine.cycle_logic import (
     detect_irregularity,
     generate_personalized_insights
 )
-from .ai_engine.lifestyle_ai import generate_lifestyle_plan
-from .ai_engine.report_generator import generate_health_report
+from .ai_engine.lifestyle_ai import generate_lifestyle_plan, generate_lifestyle_recommendations
+from .ai_engine.report_generator import generate_health_report, generate_health_summary_report
+from .ai_engine.analysis import analyze_lifestyle_report_bundle, analyze_user_wellness
 
 
 # =========================================================
@@ -89,37 +113,50 @@ class LoginView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        try:
-            username = request.data.get("username")
-            password = request.data.get("password")
+        from .db_retry import sqlite_write
+        from django.db import OperationalError
 
-            if not username or not password:
-                return Response({"error": "Username and password are required"}, status=status.HTTP_400_BAD_REQUEST)
+        username = (request.data.get("username") or "").strip()
+        password = request.data.get("password") or ""
 
+        if not username or not password:
+            return Response({"error": "Username and password are required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        def _do_login():
             try:
                 user = User.objects.get(username=username)
             except User.DoesNotExist:
-                return Response({"error": "User not found"}, status=status.HTTP_404_NOT_FOUND)
-
+                return (status.HTTP_404_NOT_FOUND, {"error": "User not found"})
             authenticated_user = authenticate(username=username, password=password)
+            if not authenticated_user:
+                return (status.HTTP_401_UNAUTHORIZED, {"error": "Invalid credentials"})
+            refresh = RefreshToken.for_user(authenticated_user)
+            return (status.HTTP_200_OK, {
+                "message": "Login successful",
+                "user": {
+                    "id": authenticated_user.id,
+                    "username": authenticated_user.username,
+                    "email": authenticated_user.email,
+                },
+                "access": str(refresh.access_token),
+                "refresh": str(refresh),
+            })
 
-            if authenticated_user:
-                refresh = RefreshToken.for_user(authenticated_user)
-                return Response({
-                    "message": "Login successful",
-                    "user": {
-                        "id": authenticated_user.id,
-                        "username": authenticated_user.username,
-                        "email": authenticated_user.email
-                    },
-                    "access": str(refresh.access_token),
-                    "refresh": str(refresh)
-                }, status=status.HTTP_200_OK)
-            else:
-                return Response({"error": "Invalid credentials"}, status=status.HTTP_401_UNAUTHORIZED)
+        try:
+            status_code, data = sqlite_write(_do_login)
+            return Response(data, status=status_code)
+        except OperationalError:
+            return Response(
+                {"error": "Database busy, please try again in a moment."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         except Exception as e:
-            print(f"Login Error: {str(e)}")
-            return Response({"error": f"Server error: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            import logging
+            logging.getLogger(__name__).exception("Login failed")
+            return Response(
+                {"error": "Server error during login. Please try again."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 
 class LogoutView(APIView):
@@ -607,6 +644,44 @@ def mood_history_detailed(request):
     })
 
 
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def mood_insights_ai(request):
+    """
+    Mood Tracker — Insights tab: one LLM call (analyze_user_wellness) using the same
+    aggregated payload as lifestyle/report (_build_wellness_llm_payload).
+    Query params: days (default 30), aligned with mood/summary and chart APIs.
+    """
+    days = int(request.query_params.get("days", 30))
+    user = request.user
+    payload = _build_wellness_llm_payload(user, days=days)
+    llm_result = _get_wellness_llm_analysis(user, days=days, payload=payload)
+
+    body = {
+        "source": "ai_engine",
+        "generated_by": "Nivara analysis.py — analyze_user_wellness",
+        "period_days": days,
+        "llm_generated": llm_result.get("status") == "success",
+        "emotional_analysis": "",
+        "care_recommendations": [],
+        "footnote": {
+            "total_entries": payload["mood_summary"].get("total_entries", 0),
+            "period_days": days,
+        },
+        "highlights": {},
+    }
+    if llm_result.get("status") == "success":
+        analysis = llm_result["analysis"]
+        body["emotional_analysis"] = _compose_emotional_analysis(analysis)
+        body["care_recommendations"] = _flatten_care_recommendations(analysis)
+        body["highlights"] = analysis.get("highlights") or {}
+    else:
+        body["error"] = llm_result.get("message")
+        body["details"] = llm_result.get("details")
+
+    return Response(body)
+
+
 # =========================================================
 # 🌙 CYCLE TRACKING
 # =========================================================
@@ -645,7 +720,165 @@ def lifestyle_plan(request):
 
 
 # =========================================================
-# 📊 HEALTH REPORT GENERATOR
+# 🌿 PHASE 4: LIFESTYLE INTELLIGENCE (AI Recommendation Engine)
+# Inputs: mood analysis, cycle phase, stress level → Yoga, Diet, Sleep, Emotional tips
+# =========================================================
+
+def _build_mood_context_for_lifestyle(request_user, days=30):
+    """Build mood_analysis_result and stress_level for Phase 4 from user's mood data."""
+    start_date = date.today() - timedelta(days=days)
+    moods = MoodEntry.objects.filter(user=request_user, entry_date__gte=start_date)
+    total = moods.count()
+    
+    if total == 0:
+        return {
+            "mood_analysis_result": {"average_mood": 5, "dominant_emotion": "neutral", "trend": "Stable"},
+            "stress_level": "Unknown"
+        }
+    
+    avg_mood = round(moods.aggregate(avg=Avg('mood_score'))['avg'] or 5, 1)
+    emotion_counts = moods.values('emotion_type').annotate(count=Count('id')).order_by('-count')
+    dominant_emotion = emotion_counts[0]['emotion_type'] if emotion_counts else "neutral"
+    
+    # Trend: compare first half vs second half of period
+    mid = start_date + timedelta(days=days // 2)
+    first_half = moods.filter(entry_date__lt=mid).aggregate(avg=Avg('mood_score'))['avg'] or 5
+    second_half = moods.filter(entry_date__gte=mid).aggregate(avg=Avg('mood_score'))['avg'] or 5
+    if second_half > first_half + 0.5:
+        trend = "Improving"
+    elif second_half < first_half - 0.5:
+        trend = "Declining"
+    else:
+        trend = "Stable"
+    
+    # Stress (same logic as mood_analytics_summary)
+    stress_emotions = ['anxious', 'stressed', 'irritated', 'overwhelmed', 'tired', 'sad']
+    stress_count = moods.filter(emotion_type__in=stress_emotions).count()
+    stress_percentage = (stress_count / total) * 100
+    journal_stress_total = 0
+    entries_with_journal = 0
+    for m in moods:
+        if m.journal_text:
+            entries_with_journal += 1
+            journal_stress_total += calculate_stress_from_journal(m.journal_text)
+    avg_journal_stress = journal_stress_total / entries_with_journal if entries_with_journal > 0 else 0
+    combined_stress = (stress_percentage * 0.6) + (avg_journal_stress * 4)
+    if combined_stress < 20:
+        stress_level = "Low"
+    elif combined_stress < 40:
+        stress_level = "Moderate"
+    elif combined_stress < 60:
+        stress_level = "High"
+    else:
+        stress_level = "Very High"
+    
+    mood_analysis_result = {
+        "average_mood": avg_mood,
+        "dominant_emotion": dominant_emotion,
+        "trend": trend,
+        "stress_percentage": round(stress_percentage, 1),
+    }
+    return {"mood_analysis_result": mood_analysis_result, "stress_level": stress_level}
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def lifestyle_recommendations(request):
+    """
+    Phase 4: Lifestyle Intelligence API.
+    Returns structured recommendations: yoga, diet, sleep, emotional regulation.
+    Uses mood analysis, cycle phase, and stress level (all derived from user data).
+    Query params: days (default 30) for mood window.
+    """
+    days = int(request.query_params.get("days", 30))
+    user = request.user
+    
+    # 1) Mood context + stress level
+    mood_ctx = _build_mood_context_for_lifestyle(user, days=days)
+    mood_analysis_result = mood_ctx["mood_analysis_result"]
+    stress_level = mood_ctx["stress_level"]
+    
+    # 2) Cycle phase (Phase 3: CycleProfile + get_cycle_status)
+    cycle_phase_info = None
+    try:
+        profile = CycleProfile.objects.get(user=user)
+        cycle_phase_info = get_cycle_status(
+            profile.last_period_start_date,
+            profile.average_cycle_length_days,
+            profile.average_period_length_days
+        )
+    except CycleProfile.DoesNotExist:
+        pass
+    
+    # 3) LLM bundle (cached; shares one Azure call with health report) or rule-based fallback
+    compiled = _build_health_summary_compiled_data(user, days=days)
+    bundle = _get_llm_lifestyle_report_bundle(user, days=days, compiled=compiled)
+    llm_generated = (
+        bundle.get("status") == "success" and bundle.get("lifestyle") is not None
+    )
+    if llm_generated:
+        recommendations = bundle["lifestyle"]
+    else:
+        recommendations = generate_lifestyle_recommendations(
+            mood_analysis_result, cycle_phase_info, stress_level
+        )
+
+    # 4) Build context for frontend ("Based on: ...")
+    context = {
+        "mood_analysis": mood_analysis_result,
+        "cycle_phase": cycle_phase_info,
+        "stress_level": stress_level,
+        "period_days": days,
+    }
+
+    return Response({
+        "source": "ai_engine",
+        "generated_by": "Nivara analysis engine (Azure OpenAI via analysis.py)",
+        "message": (
+            "Recommendations from a single LLM pass over your mood, cycle, and report context "
+            "when available; otherwise rule-based templates."
+        ),
+        "context": context,
+        "recommendations": recommendations,
+        "llm_generated": llm_generated,
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def lifestyle_recommendations_context(request):
+    """
+    Phase 4: Get only the context (mood, cycle phase, stress) without recommendations.
+    Useful for displaying "Based on your current context" before loading full recommendations.
+    Query params: days (default 30).
+    """
+    days = int(request.query_params.get("days", 30))
+    user = request.user
+    
+    mood_ctx = _build_mood_context_for_lifestyle(user, days=days)
+    cycle_phase_info = None
+    try:
+        profile = CycleProfile.objects.get(user=user)
+        cycle_phase_info = get_cycle_status(
+            profile.last_period_start_date,
+            profile.average_cycle_length_days,
+            profile.average_period_length_days
+        )
+    except CycleProfile.DoesNotExist:
+        pass
+    
+    return Response({
+        "source": "ai_engine",
+        "message": "Context is derived from the AI-engine model (mood analysis, cycle phase, stress level).",
+        "mood_analysis": mood_ctx["mood_analysis_result"],
+        "cycle_phase": cycle_phase_info,
+        "stress_level": mood_ctx["stress_level"],
+        "period_days": days,
+    })
+
+
+# =========================================================
+# 📊 HEALTH REPORT GENERATOR (Legacy)
 # =========================================================
 
 @api_view(["GET"])
@@ -658,6 +891,563 @@ def generate_report(request):
 
     report = generate_health_report(analysis, cycles)
     return Response({"report": report})
+
+
+# =========================================================
+# 🌸 PHASE 6: AI HEALTH REPORT GENERATOR (Generate Health Summary)
+# Compiles: mood statistics, cycle patterns, stress markers, lifestyle consistency
+# Returns: professional report, risk flags, suggestions, summary insights
+# =========================================================
+
+def _build_health_summary_compiled_data(user, days=30):
+    """Compile mood stats, cycle patterns, stress markers, lifestyle consistency for Phase 6 report."""
+    start_date = date.today() - timedelta(days=days)
+    moods = MoodEntry.objects.filter(user=user, entry_date__gte=start_date)
+    total_entries = moods.count()
+
+    # --- Mood statistics (aligned with Phase 2 summary) ---
+    mood_ctx = _build_mood_context_for_lifestyle(user, days=days)
+    mood_result = mood_ctx["mood_analysis_result"]
+    mood_statistics = {
+        "average_mood": mood_result.get("average_mood"),
+        "dominant_emotion": mood_result.get("dominant_emotion"),
+        "trend": mood_result.get("trend"),
+        "stress_percentage": mood_result.get("stress_percentage"),
+        "total_entries": total_entries,
+        "period_days": days,
+    }
+    if total_entries > 1:
+        mood_scores = list(moods.values_list("mood_score", flat=True))
+        mean = sum(mood_scores) / len(mood_scores)
+        variance = sum((x - mean) ** 2 for x in mood_scores) / len(mood_scores)
+        std_dev = variance ** 0.5
+        max_std = 4.5
+        mood_statistics["mood_stability_index"] = round(max(0, 100 - (std_dev / max_std * 100)), 1)
+    else:
+        mood_statistics["mood_stability_index"] = None
+
+    # --- Stress markers ---
+    stress_level = mood_ctx["stress_level"]
+    stress_markers = {
+        "stress_level": stress_level,
+        "stress_percentage": mood_result.get("stress_percentage"),
+        "markers": [],
+        "summary_note": f"Stress level is {stress_level} over the last {days} days.",
+    }
+    if stress_level in ("High", "Very High"):
+        stress_markers["markers"] = ["Elevated stress-related emotions", "Consider stress-management focus"]
+
+    # --- Cycle patterns (Phase 3: profile + status + irregularity) ---
+    cycle_patterns = None
+    try:
+        profile = CycleProfile.objects.get(user=user)
+        status_data = get_cycle_status(
+            profile.last_period_start_date,
+            profile.average_cycle_length_days,
+            profile.average_period_length_days,
+        )
+        period_logs = list(
+            PeriodLog.objects.filter(user=user).values(
+                "period_start_date", "cycle_length_from_previous", "actual_period_length"
+            )
+        )
+        irregularity = detect_irregularity(period_logs, profile.average_cycle_length_days) if len(period_logs) >= 2 else {}
+        cycle_patterns = {
+            "cycle_phase": status_data.get("cycle_phase"),
+            "phase_display": status_data.get("phase_display"),
+            "cycle_day": status_data.get("cycle_day"),
+            "pms_window": status_data.get("pms_window"),
+            "regularity_message": irregularity.get("regularity_message"),
+            "regularity_status": irregularity.get("regularity_status"),
+            "irregularity_analysis": irregularity if irregularity.get("has_data") else None,
+        }
+    except CycleProfile.DoesNotExist:
+        pass
+
+    # --- Lifestyle consistency ---
+    mood_logging_consistency = "high" if total_entries >= 20 else ("medium" if total_entries >= 7 else "low")
+    sleep_note = None
+    if getattr(user, "sleep_average", None) is not None:
+        sleep_note = f"Profile sleep quality average: {user.sleep_average}/10."
+    lifestyle_consistency = {
+        "mood_logging_consistency": mood_logging_consistency,
+        "sleep_note": sleep_note,
+        "profile_complete": getattr(user, "is_profile_complete", False),
+        "consistency_summary": f"Mood logging consistency: {mood_logging_consistency}. " + (sleep_note or "Complete profile for sleep insights."),
+    }
+
+    return {
+        "mood_statistics": mood_statistics,
+        "cycle_patterns": cycle_patterns,
+        "stress_markers": stress_markers,
+        "lifestyle_consistency": lifestyle_consistency,
+    }
+
+
+def _compact_report_for_llm(compiled: dict) -> dict:
+    """Small factual dict for the LLM (keeps token use down)."""
+    mood = compiled.get("mood_statistics") or {}
+    stress = compiled.get("stress_markers") or {}
+    cycle = compiled.get("cycle_patterns") or {}
+    life = compiled.get("lifestyle_consistency") or {}
+    ir = (cycle.get("irregularity_analysis") or {}) if cycle else {}
+    return {
+        "average_mood": mood.get("average_mood"),
+        "dominant_emotion": mood.get("dominant_emotion"),
+        "trend": mood.get("trend"),
+        "total_entries": mood.get("total_entries"),
+        "mood_stability_index": mood.get("mood_stability_index"),
+        "stress_level": stress.get("stress_level"),
+        "stress_percentage": stress.get("stress_percentage"),
+        "cycle_phase": cycle.get("cycle_phase") or cycle.get("phase_display"),
+        "phase_display": cycle.get("phase_display"),
+        "cycle_day": cycle.get("cycle_day"),
+        "pms_window": cycle.get("pms_window"),
+        "cycle_regularity_note": ir.get("regularity_message"),
+        "mood_logging_consistency": life.get("mood_logging_consistency"),
+        "sleep_note": life.get("sleep_note"),
+    }
+
+
+def _build_wellness_llm_payload(request_user, days=30):
+    """
+    Build the aggregated payload expected by nivara_app.ai_engine.analysis.validate_payload.
+    """
+    start_date = date.today() - timedelta(days=days)
+    moods = MoodEntry.objects.filter(user=request_user, entry_date__gte=start_date)
+    total_entries = moods.count()
+
+    stress_emotions = [
+        "anxious",
+        "stressed",
+        "irritated",
+        "overwhelmed",
+        "tired",
+        "sad",
+    ]
+
+    if total_entries == 0:
+        avg_mood = 5.0
+        dominant_emotion = "neutral"
+        stress_level = "Unknown"
+        stress_pct = 0.0
+        weekly_variation = 0.0
+        stability_index = 50.0
+        emotional_variance = 0.0
+    else:
+        avg_mood = round(moods.aggregate(avg=Avg("mood_score"))["avg"] or 5, 1)
+        emotion_counts = moods.values("emotion_type").annotate(c=Count("id")).order_by("-c")
+        dominant_emotion = emotion_counts[0]["emotion_type"] if emotion_counts else "neutral"
+        stress_count = moods.filter(emotion_type__in=stress_emotions).count()
+        stress_pct = round((stress_count / total_entries) * 100, 1)
+        journal_stress_total = 0
+        entries_with_journal = 0
+        for m in moods:
+            if m.journal_text:
+                entries_with_journal += 1
+                journal_stress_total += calculate_stress_from_journal(m.journal_text)
+        avg_journal_stress = (
+            journal_stress_total / entries_with_journal if entries_with_journal > 0 else 0
+        )
+        combined_stress = (stress_pct * 0.6) + (avg_journal_stress * 4)
+        if combined_stress < 20:
+            stress_level = "Low"
+        elif combined_stress < 40:
+            stress_level = "Moderate"
+        elif combined_stress < 60:
+            stress_level = "High"
+        else:
+            stress_level = "Very High"
+        mood_scores = list(moods.values_list("mood_score", flat=True))
+        if len(mood_scores) > 1:
+            mean = sum(mood_scores) / len(mood_scores)
+            variance = sum((x - mean) ** 2 for x in mood_scores) / len(mood_scores)
+            weekly_variation = round(variance**0.5, 1)
+        else:
+            weekly_variation = 0.0
+        max_possible_std = 4.5
+        stability_index = round(
+            max(0, 100 - (weekly_variation / max_possible_std * 100)), 1
+        )
+        emotional_variance = weekly_variation
+
+    mood_summary = {
+        "period_days": days,
+        "total_entries": total_entries,
+        "average_mood": avg_mood,
+        "dominant_emotion": dominant_emotion,
+        "stress_level": stress_level,
+        "stress_percentage": stress_pct,
+        "weekly_variation": weekly_variation,
+        "mood_stability_index": stability_index,
+        "emotional_variance": emotional_variance,
+    }
+
+    daily_data = (
+        moods.values("entry_date")
+        .annotate(avg_mood=Avg("mood_score"), entries_count=Count("id"))
+        .order_by("entry_date")
+    )
+    trend_data = [
+        {
+            "date": entry["entry_date"].strftime("%Y-%m-%d"),
+            "mood_score": round(entry["avg_mood"], 1) if entry["avg_mood"] else 0,
+            "entries": entry["entries_count"],
+        }
+        for entry in daily_data
+    ]
+    mood_trend = {
+        "period_days": days,
+        "data_points": len(trend_data),
+        "trend_data": trend_data,
+    }
+
+    if total_entries == 0:
+        emotion_distribution = {
+            "period_days": days,
+            "total_entries": 0,
+            "distribution": [],
+            "category_breakdown": {"positive": 0.0, "negative": 0.0, "neutral": 0.0},
+        }
+    else:
+        emotion_rows = moods.values("emotion_type").annotate(count=Count("id")).order_by("-count")
+        distribution = [
+            {
+                "emotion": row["emotion_type"],
+                "count": row["count"],
+                "percentage": round((row["count"] / total_entries) * 100, 1),
+            }
+            for row in emotion_rows
+        ]
+        category_counts = {"positive": 0, "negative": 0, "neutral": 0}
+        for row in emotion_rows:
+            category = get_emotion_category(row["emotion_type"])
+            category_counts[category] += row["count"]
+        category_breakdown = {
+            k: round((v / total_entries) * 100, 1) for k, v in category_counts.items()
+        }
+        emotion_distribution = {
+            "period_days": days,
+            "total_entries": total_entries,
+            "distribution": distribution,
+            "category_breakdown": category_breakdown,
+        }
+
+    weekly_data = moods.annotate(week=TruncWeek("entry_date")).values("week").annotate(
+        total_entries=Count("id"), avg_mood=Avg("mood_score")
+    ).order_by("week")
+    stress_by_week = []
+    for week_entry in weekly_data:
+        week_start = week_entry["week"]
+        week_end = week_start + timedelta(days=7)
+        week_moods = moods.filter(entry_date__gte=week_start, entry_date__lt=week_end)
+        stress_emotion_count = week_moods.filter(
+            emotion_type__in=stress_emotions
+        ).count()
+        journal_stress = 0
+        for mood in week_moods:
+            if mood.journal_text:
+                journal_stress += calculate_stress_from_journal(mood.journal_text)
+        total_w = week_entry["total_entries"]
+        spct = round((stress_emotion_count / total_w) * 100, 1) if total_w > 0 else 0
+        stress_by_week.append(
+            {
+                "week_start": week_start.strftime("%Y-%m-%d"),
+                "total_entries": total_w,
+                "stress_emotion_count": stress_emotion_count,
+                "stress_percentage": spct,
+                "journal_stress_score": journal_stress,
+                "avg_mood": round(week_entry["avg_mood"], 1) if week_entry["avg_mood"] else 0,
+            }
+        )
+    keyword_frequency = Counter()
+    for mood in moods:
+        if mood.journal_text:
+            text_lower = mood.journal_text.lower()
+            for keyword in STRESS_KEYWORDS:
+                if keyword in text_lower:
+                    keyword_frequency[keyword] += 1
+    top_stress_keywords = [
+        {"keyword": k, "count": v} for k, v in keyword_frequency.most_common(10)
+    ]
+    stress_analysis = {
+        "period_days": days,
+        "weekly_stress_data": stress_by_week,
+        "top_stress_keywords": top_stress_keywords,
+    }
+
+    entries = []
+    for m in moods.order_by("-entry_date", "-created_at")[:45]:
+        entries.append(
+            {
+                "mood_score": m.mood_score,
+                "emotion_type": m.emotion_type,
+                "journal_text": (m.journal_text or "")[:500],
+                "entry_date": m.entry_date.strftime("%Y-%m-%d"),
+            }
+        )
+    recent_mood_entries = {"period_days": days, "count": len(entries), "entries": entries}
+
+    try:
+        profile = CycleProfile.objects.get(user=request_user)
+        cycle_status = get_cycle_status(
+            profile.last_period_start_date,
+            profile.average_cycle_length_days,
+            profile.average_period_length_days,
+        )
+    except CycleProfile.DoesNotExist:
+        cycle_status = {
+            "cycle_day": 1,
+            "cycle_phase": "follicular",
+            "phase_display": "Cycle profile not set",
+            "phase_description": "Complete cycle onboarding for accurate phase-based tips.",
+            "energy_level": "moderate",
+            "hormone_status": "Unknown without cycle profile",
+            "days_until_next_period": None,
+            "predicted_next_period": None,
+            "pms_window": False,
+            "fertile_window": None,
+            "is_fertile_today": False,
+        }
+
+    return {
+        "mood_summary": mood_summary,
+        "mood_trend": mood_trend,
+        "emotion_distribution": emotion_distribution,
+        "stress_analysis": stress_analysis,
+        "recent_mood_entries": recent_mood_entries,
+        "cycle_status": cycle_status,
+    }
+
+
+def _compose_emotional_analysis(analysis):
+    """One paragraph for Mood Insights from analyze_user_wellness."""
+    if not isinstance(analysis, dict):
+        return ""
+    cs = analysis.get("current_status") or {}
+    parts = [
+        cs.get("emotional_overview"),
+        cs.get("stability_insight"),
+        cs.get("stress_reflection"),
+        cs.get("cycle_mood_connection"),
+        cs.get("overall_interpretation"),
+    ]
+    return " ".join(p.strip() for p in parts if p and str(p).strip())
+
+
+def _flatten_care_recommendations(analysis):
+    """Flatten recommendation groups into a short list for the Mood UI."""
+    if not isinstance(analysis, dict):
+        return []
+    rec = analysis.get("recommendations") or {}
+    out = []
+    for key in (
+        "emotional_support",
+        "lifestyle_suggestions",
+        "stress_management",
+        "cycle_phase_tips",
+    ):
+        items = rec.get(key)
+        if isinstance(items, list):
+            for x in items:
+                if x is not None and str(x).strip():
+                    out.append(str(x).strip())
+    ga = rec.get("gentle_advice")
+    if ga and str(ga).strip():
+        out.append(str(ga).strip())
+    seen = set()
+    unique = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            unique.append(x)
+    return unique[:12]
+
+
+def _get_wellness_llm_analysis(request_user, days=30, payload=None):
+    """Single analyze_user_wellness LLM call; cached 10 minutes per user/days."""
+    cache_key = f"nivara_wellness_analysis_{request_user.id}_{days}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+    if payload is None:
+        payload = _build_wellness_llm_payload(request_user, days=days)
+    out = analyze_user_wellness(payload)
+    if out.get("status") == "success":
+        cache.set(cache_key, out, timeout=600)
+    return out
+
+
+def _shape_cycle_llm_insights(llm_result, regularity):
+    """Map analyze_user_wellness output to cycle insights UI fields."""
+    base = {
+        "personalized_insights": "",
+        "mood_cycle_connection": "",
+        "cycle_regularity_narrative": "",
+        "alerts": [],
+        "phase_tips": {
+            "menstrual": "",
+            "follicular": "",
+            "ovulation": "",
+            "luteal": "",
+        },
+    }
+    if llm_result.get("status") != "success":
+        base["error"] = llm_result.get("message")
+        return base
+
+    analysis = llm_result.get("analysis") or {}
+    cs = analysis.get("current_status") or {}
+    rec = analysis.get("recommendations") or {}
+    hl = analysis.get("highlights") or {}
+
+    tips = rec.get("cycle_phase_tips")
+    if not isinstance(tips, list):
+        tips = []
+    phase_order = ["menstrual", "follicular", "ovulation", "luteal"]
+    for i, phase in enumerate(phase_order):
+        if i < len(tips) and tips[i]:
+            base["phase_tips"][phase] = str(tips[i]).strip()
+
+    base["personalized_insights"] = " ".join(
+        p
+        for p in [cs.get("emotional_overview"), cs.get("overall_interpretation")]
+        if p and str(p).strip()
+    ).strip()
+    base["mood_cycle_connection"] = (cs.get("cycle_mood_connection") or "").strip()
+
+    reg_msg = (regularity or {}).get("regularity_message") if isinstance(regularity, dict) else ""
+    stability = (cs.get("stability_insight") or "").strip()
+    positive = (hl.get("positive_pattern") or "").strip()
+    base["cycle_regularity_narrative"] = " ".join(
+        p for p in [reg_msg, stability, positive] if p
+    ).strip()
+
+    alerts = []
+    for key in ("watch_out_for", "energy_note"):
+        v = hl.get(key)
+        if v and str(v).strip():
+            alerts.append(str(v).strip())
+    sr = cs.get("stress_reflection")
+    if sr and str(sr).strip():
+        alerts.append(str(sr).strip())
+    base["alerts"] = alerts[:6]
+    return base
+
+
+def _get_llm_lifestyle_report_bundle(request_user, days=30, compiled=None):
+    """
+    One Azure completion → lifestyle cards + report narrative; cached 10 minutes per user/days.
+    """
+    cache_key = f"nivara_llm_bundle_{request_user.id}_{days}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if compiled is None:
+        compiled = _build_health_summary_compiled_data(request_user, days=days)
+    payload = _build_wellness_llm_payload(request_user, days=days)
+    report_ctx = _compact_report_for_llm(compiled)
+    bundle = analyze_lifestyle_report_bundle(payload, report_context=report_ctx)
+    if bundle.get("status") == "success":
+        cache.set(cache_key, bundle, timeout=600)
+    return bundle
+
+
+def _lifestyle_for_report(user, days, bundle):
+    """
+    Same objects as lifestyle/recommendations/: LLM lifestyle from bundle when available,
+    else rule-based. Used so PDF / doctor report includes actionable lifestyle guidance.
+    """
+    if bundle.get("status") == "success" and bundle.get("lifestyle"):
+        return bundle["lifestyle"], True
+    mood_ctx = _build_mood_context_for_lifestyle(user, days=days)
+    mood_analysis_result = mood_ctx["mood_analysis_result"]
+    stress_level = mood_ctx["stress_level"]
+    cycle_phase_info = None
+    try:
+        profile = CycleProfile.objects.get(user=user)
+        cycle_phase_info = get_cycle_status(
+            profile.last_period_start_date,
+            profile.average_cycle_length_days,
+            profile.average_period_length_days,
+        )
+    except CycleProfile.DoesNotExist:
+        pass
+    return (
+        generate_lifestyle_recommendations(
+            mood_analysis_result, cycle_phase_info, stress_level
+        ),
+        False,
+    )
+
+
+def _merge_ai_bundle_into_report(report_data, user, days, bundle):
+    """Attach LLM narrative + lifestyle block (for UI/PDF, doctor review)."""
+    if bundle.get("status") == "success" and bundle.get("report_ai"):
+        report_data["llm_insights"] = bundle["report_ai"]
+    report_data["llm_generated"] = (
+        bundle.get("status") == "success" and bundle.get("report_ai") is not None
+    )
+    lifestyle, lifestyle_llm = _lifestyle_for_report(user, days, bundle)
+    report_data["lifestyle_recommendations"] = lifestyle
+    report_data["lifestyle_llm_generated"] = lifestyle_llm
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def health_summary_report(request):
+    """
+    Phase 6: Generate Health Summary (AI Health Report).
+    User clicks "Generate Health Summary" → backend compiles mood stats, cycle patterns,
+    stress markers, lifestyle consistency; returns professional report, risk flags, suggestions, summary.
+    Query params: days (default 30).
+    """
+    days = int(request.query_params.get("days", 30))
+    user = request.user
+    compiled = _build_health_summary_compiled_data(user, days=days)
+    report_data = generate_health_summary_report(compiled)
+    report_data["generated_at"] = timezone.now().isoformat()
+    bundle = _get_llm_lifestyle_report_bundle(user, days=days, compiled=compiled)
+    _merge_ai_bundle_into_report(report_data, user, days, bundle)
+    return Response({
+        "source": "ai_engine",
+        "generated_by": "AI Health Report Generator",
+        "message": (
+            "Structured sections from compiled data; llm_insights = AI narrative; "
+            "lifestyle_recommendations = same AI bundle as Lifestyle Intelligence when available "
+            "(else rule-based), suitable for PDF / clinician review."
+        ),
+        "period_days": days,
+        "report": report_data,
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def health_summary_export(request):
+    """
+    Phase 6: Export Health Summary (e.g. for PDF).
+    Returns the same report as JSON with export_ready flag for frontend PDF generation (print-to-PDF or js PDF lib).
+    Query params: days (default 30).
+    """
+    days = int(request.query_params.get("days", 30))
+    user = request.user
+    compiled = _build_health_summary_compiled_data(user, days=days)
+    report_data = generate_health_summary_report(compiled)
+    report_data["generated_at"] = timezone.now().isoformat()
+    bundle = _get_llm_lifestyle_report_bundle(user, days=days, compiled=compiled)
+    _merge_ai_bundle_into_report(report_data, user, days, bundle)
+    return Response({
+        "source": "ai_engine",
+        "export_ready": True,
+        "period_days": days,
+        "report": report_data,
+        "message": (
+            "Use for PDF export. report.lifestyle_recommendations mirrors Lifestyle Intelligence "
+            "(AI when llm bundle succeeds). Prefer compact 2-page layout on the client."
+        ),
+    })
 
 
 # =========================================================
@@ -675,6 +1465,193 @@ def chat_with_ai(request):
 
     response = chatbot_response(user_message)
     return Response({"response": response})
+
+
+# =========================================================
+# 🤖 NIVARA CHATBOT (Azure OpenAI – generic_chat)
+# One user message → one backend request → one Azure API call (cost-optimised).
+# Frontend sends history in body; we do not call the API multiple times per turn.
+# =========================================================
+
+def _chat_history_turns_from_db(session, max_turns=8):
+    """Build history list for Azure from stored messages (last N complete turns)."""
+    from .ai_engine.generic_chat import MAX_HISTORY_TURNS
+    max_turns = min(max_turns, MAX_HISTORY_TURNS)
+    msgs = list(ChatMessage.objects.filter(session=session).order_by("id"))
+    msgs = msgs[-(max_turns * 2) :]
+    turns = []
+    i = 0
+    while i < len(msgs) - 1:
+        if msgs[i].role == "user" and msgs[i + 1].role == "assistant":
+            turns.append({"human_msg": msgs[i].content, "ai_msg": msgs[i + 1].content})
+            i += 2
+        else:
+            i += 1
+    return turns
+
+
+def _nivara_single_llm_turn(request, message: str):
+    """
+    Exactly ONE Azure OpenAI (GPT) API call per message (generic_chat.generate_chat_response).
+    """
+    try:
+        from .ai_engine.generic_chat import generate_chat_response, MAX_HISTORY_TURNS
+    except ModuleNotFoundError as e:
+        if "openai" in str(e).lower():
+            return Response(
+                {
+                    "error": "Missing dependency",
+                    "detail": 'Install in your venv: pip install openai python-dotenv',
+                },
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        raise
+
+    message = (message or "").strip()
+    if not message:
+        return Response({"error": "Message required"}, status=status.HTTP_400_BAD_REQUEST)
+
+    session_id = request.data.get("session_id")
+    has_session_id = session_id is not None and str(session_id).strip() != ""
+
+    if request.user.is_authenticated and not has_session_id:
+        # New conversation: create session in this request (avoids extra POST /api/chat/sessions/)
+        from .db_retry import sqlite_write
+
+        def _create():
+            return ChatSession.objects.create(user=request.user, title="")
+
+        session = sqlite_write(_create)
+        use_db_history = True
+        history = []
+    elif request.user.is_authenticated and has_session_id:
+        try:
+            sid = int(session_id)
+        except (TypeError, ValueError):
+            return Response({"error": "Invalid session_id"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            session = ChatSession.objects.get(id=sid, user=request.user)
+        except ChatSession.DoesNotExist:
+            return Response({"error": "Session not found"}, status=status.HTTP_404_NOT_FOUND)
+        use_db_history = True
+        history = _chat_history_turns_from_db(session)
+    else:
+        session = None
+        use_db_history = False
+        history = request.data.get("history")
+        if not isinstance(history, list):
+            history = []
+        history = [
+            {"human_msg": str(t.get("human_msg", "")), "ai_msg": str(t.get("ai_msg", ""))}
+            for t in history
+            if isinstance(t, dict) and (t.get("human_msg") or t.get("ai_msg"))
+        ]
+
+    reply = generate_chat_response(history, message)
+    from .chat_formatting import compact_assistant_reply
+    reply = compact_assistant_reply(reply)
+
+    if use_db_history and reply and not reply.startswith("[Error"):
+        from .db_retry import sqlite_write
+
+        def _save_chat_turn():
+            ChatMessage.objects.create(session=session, role="user", content=message)
+            ChatMessage.objects.create(session=session, role="assistant", content=reply)
+            if not session.title:
+                session.title = (message[:197] + "...") if len(message) > 200 else message
+                session.save(update_fields=["title", "updated_at"])
+            else:
+                session.save(update_fields=["updated_at"])
+            return _chat_history_turns_from_db(session)
+
+        updated_history = sqlite_write(_save_chat_turn)
+    else:
+        updated_history = list(history)
+        if reply and not reply.startswith("[Error"):
+            updated_history.append({"human_msg": message, "ai_msg": reply})
+            updated_history = updated_history[-MAX_HISTORY_TURNS:]
+
+    out = {"reply": reply, "history": updated_history}
+    if use_db_history:
+        out["session_id"] = session.id
+    return Response(out)
+
+
+@csrf_exempt
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def chat_nivara(request):
+    """
+    Text chat: exactly ONE GPT call per request (lowest LLM cost).
+
+    A) Logged-in + session_id: { "message", "session_id" }
+    B) Guest: { "message", "history": [...] }
+    """
+    return _nivara_single_llm_turn(request, request.data.get("message") or "")
+
+
+class ChatSessionsView(APIView):
+    """
+    GET: list past sessions (no Azure).
+    POST: start new session (no Azure).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = ChatSession.objects.filter(user=request.user)[:100]
+        data = [
+            {
+                "id": s.id,
+                "title": s.title or "New conversation",
+                "updated_at": s.updated_at.isoformat(),
+                "created_at": s.created_at.isoformat(),
+            }
+            for s in qs
+        ]
+        return Response({"count": len(data), "sessions": data})
+
+    def post(self, request):
+        from .db_retry import sqlite_write
+
+        def _create():
+            return ChatSession.objects.create(user=request.user, title="")
+
+        s = sqlite_write(_create)
+        return Response(
+            {
+                "session_id": s.id,
+                "message": "New session started. POST to /api/chat/nivara/ with session_id and message.",
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class ChatSessionDetailView(APIView):
+    """Full conversation for one session (read-only). No Azure call."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, session_id):
+        try:
+            s = ChatSession.objects.get(id=session_id, user=request.user)
+        except ChatSession.DoesNotExist:
+            return Response({"error": "Session not found"}, status=status.HTTP_404_NOT_FOUND)
+        msgs = ChatMessage.objects.filter(session=s).order_by("id")
+        messages = [
+            {
+                "role": m.role,
+                "content": m.content,
+                "created_at": m.created_at.isoformat(),
+            }
+            for m in msgs
+        ]
+        return Response(
+            {
+                "session_id": s.id,
+                "title": s.title or "Conversation",
+                "updated_at": s.updated_at.isoformat(),
+                "messages": messages,
+            }
+        )
 
 
 # =========================================================
@@ -1139,12 +2116,49 @@ class CycleInsightsView(APIView):
                 'physical_symptoms': latest_checkin.physical_symptoms
             }
         
-        # Generate insights
+        # Generate insights (rule-based fallback / extra context)
         insights = generate_personalized_insights(cycle_status, mood_data, checkin_data)
-        
+
+        days = int(request.query_params.get("mood_window_days", 30))
+        period_logs = list(
+            PeriodLog.objects.filter(user=request.user).values(
+                "period_start_date",
+                "cycle_length_from_previous",
+                "actual_period_length",
+            )
+        )
+        regularity = (
+            detect_irregularity(period_logs, profile.average_cycle_length_days)
+            if len(period_logs) >= 2
+            else {"has_data": False, "message": "Need at least 2 period records for irregularity analysis"}
+        )
+
+        wellness_payload = _build_wellness_llm_payload(request.user, days=days)
+        llm_result = _get_wellness_llm_analysis(
+            request.user, days=days, payload=wellness_payload
+        )
+        llm_block = _shape_cycle_llm_insights(llm_result, regularity)
+        prediction = {
+            "predicted_next_period": cycle_status.get("predicted_next_period"),
+            "days_until_next_period": cycle_status.get("days_until_next_period"),
+            "countdown_message": cycle_status.get("countdown_message"),
+        }
+
         return Response({
             "cycle_status": cycle_status,
-            "insights": insights
+            "insights": insights,
+            "regularity_analysis": regularity,
+            "prediction": prediction,
+            "llm": {
+                "generated": llm_result.get("status") == "success",
+                "personalized_insights": llm_block.get("personalized_insights", ""),
+                "mood_cycle_connection": llm_block.get("mood_cycle_connection", ""),
+                "cycle_regularity_narrative": llm_block.get("cycle_regularity_narrative", ""),
+                "alerts": llm_block.get("alerts", []),
+                "phase_tips": llm_block.get("phase_tips", {}),
+                "error": llm_block.get("error"),
+            },
+            "mood_window_days": days,
         })
 
 
@@ -1417,3 +2431,281 @@ def cycle_options(request):
             {"value": "no_symptoms", "label": "No symptoms"}
         ]
     })
+
+
+# =========================================================
+# 🏥 PHASE 7: DOCTOR CONSULTATION LAYER
+# AI Insight → Human Expertise: Book doctor, share report, virtual consultation
+# =========================================================
+
+class HospitalListView(APIView):
+    """List all active hospitals (for dropdown / browse)."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        hospitals = Hospital.objects.filter(is_active=True).order_by('city', 'name')
+        serializer = HospitalSerializer(hospitals, many=True)
+        return Response({"count": hospitals.count(), "hospitals": serializer.data})
+
+
+class DoctorListView(APIView):
+    """List doctors; optional filters: hospital_id, specialization."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = Doctor.objects.filter(is_active=True).select_related('hospital').order_by('name')
+        hospital_id = request.query_params.get('hospital_id')
+        specialization = request.query_params.get('specialization')
+        if hospital_id:
+            qs = qs.filter(hospital_id=hospital_id)
+        if specialization:
+            qs = qs.filter(specialization=specialization)
+        serializer = DoctorListSerializer(qs, many=True)
+        return Response({"count": qs.count(), "doctors": serializer.data})
+
+
+class DoctorDetailView(APIView):
+    """Get single doctor with hospital details."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, doctor_id):
+        try:
+            doctor = Doctor.objects.select_related('hospital').get(id=doctor_id, is_active=True)
+            serializer = DoctorSerializer(doctor)
+            return Response(serializer.data)
+        except Doctor.DoesNotExist:
+            return Response({"error": "Doctor not found"}, status=status.HTTP_404_NOT_FOUND)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def doctor_consultation_options(request):
+    """Payment methods and consultation types for frontend dropdowns."""
+    return Response({
+        "payment_methods": [
+            {"value": "upi", "label": "UPI"},
+            {"value": "debit_card", "label": "Debit Card"},
+            {"value": "credit_card", "label": "Credit Card"},
+            {"value": "net_banking", "label": "Net Banking"},
+            {"value": "wallet", "label": "Wallet"},
+        ],
+        "consultation_types": [
+            {"value": "virtual", "label": "Virtual Consultation"},
+            {"value": "in_person", "label": "In-Person Visit"},
+        ],
+        "doctor_specializations": [
+            {"value": "gynecology", "label": "Gynecology"},
+            {"value": "obstetrics", "label": "Obstetrics"},
+            {"value": "reproductive_endocrinology", "label": "Reproductive Endocrinology"},
+            {"value": "womens_health", "label": "Women's Health & Wellness"},
+            {"value": "fertility", "label": "Fertility Specialist"},
+            {"value": "pcos", "label": "PCOS & Hormonal Health"},
+            {"value": "menopause", "label": "Menopause Care"},
+        ],
+    })
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def report_for_booking(request):
+    """Get current user's AI health report for sharing with doctor (used when share_report=true)."""
+    days = int(request.query_params.get("days", 30))
+    user = request.user
+    compiled = _build_health_summary_compiled_data(user, days=days)
+    report_data = generate_health_summary_report(compiled)
+    report_data["generated_at"] = timezone.now().isoformat()
+    bundle = _get_llm_lifestyle_report_bundle(user, days=days, compiled=compiled)
+    _merge_ai_bundle_into_report(report_data, user, days, bundle)
+    return Response({
+        "report": report_data,
+        "period_days": days,
+        "message": "Use this report when booking to share with your doctor.",
+    })
+
+
+class DoctorBookingCreateView(APIView):
+    """Create a doctor consultation booking. If report_shared=True, attach current AI report snapshot."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = DoctorConsultationBookingCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        doctor_id = serializer.validated_data["doctor"].id
+        try:
+            doctor = Doctor.objects.get(id=doctor_id, is_active=True)
+        except Doctor.DoesNotExist:
+            return Response({"error": "Doctor not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        report_shared = serializer.validated_data.get("report_shared", False)
+        report_snapshot = None
+        if report_shared:
+            compiled = _build_health_summary_compiled_data(request.user, days=30)
+            report_snapshot = generate_health_summary_report(compiled)
+            report_snapshot["generated_at"] = timezone.now().isoformat()
+            bundle = _get_llm_lifestyle_report_bundle(
+                request.user, days=30, compiled=compiled
+            )
+            _merge_ai_bundle_into_report(report_snapshot, request.user, 30, bundle)
+
+        booking = DoctorConsultationBooking.objects.create(
+            user=request.user,
+            doctor=doctor,
+            scheduled_at=serializer.validated_data["scheduled_at"],
+            consultation_type=serializer.validated_data.get("consultation_type", "virtual"),
+            report_shared=report_shared,
+            report_snapshot=report_snapshot,
+            notes=serializer.validated_data.get("notes", ""),
+            status="payment_pending",
+        )
+        # Create pending payment record; user selects method in payment/initiate
+        Payment.objects.create(
+            booking=booking,
+            amount=doctor.consultation_fee,
+            currency="INR",
+            payment_method="pending",
+            payment_status="pending",
+        )
+        booking_serializer = DoctorConsultationBookingSerializer(booking)
+        return Response({
+            "message": "Booking created. Complete payment to confirm.",
+            "booking": booking_serializer.data,
+        }, status=status.HTTP_201_CREATED)
+
+
+class DoctorBookingListView(APIView):
+    """List current user's doctor consultation bookings."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        bookings = DoctorConsultationBooking.objects.filter(user=request.user).select_related(
+            "doctor", "doctor__hospital"
+        ).prefetch_related("payment").order_by("-scheduled_at")
+        serializer = DoctorConsultationBookingSerializer(bookings, many=True)
+        return Response({"count": bookings.count(), "bookings": serializer.data})
+
+
+class DoctorBookingDetailView(APIView):
+    """Get one booking by id (for payment page)."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, booking_id):
+        try:
+            booking = DoctorConsultationBooking.objects.select_related(
+                "doctor", "doctor__hospital"
+            ).get(id=booking_id, user=request.user)
+            serializer = DoctorConsultationBookingSerializer(booking)
+            return Response(serializer.data)
+        except DoctorConsultationBooking.DoesNotExist:
+            return Response({"error": "Booking not found"}, status=status.HTTP_404_NOT_FOUND)
+
+
+class PaymentInitiateView(APIView):
+    """Initiate payment for a booking (dummy: just records method and returns order_id)."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, booking_id):
+        try:
+            booking = DoctorConsultationBooking.objects.get(id=booking_id, user=request.user)
+        except DoctorConsultationBooking.DoesNotExist:
+            return Response({"error": "Booking not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        if booking.status not in ("pending", "payment_pending"):
+            return Response(
+                {"error": "Booking is not in payment pending state."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        ser = PaymentInitiateSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        payment_method = ser.validated_data["payment_method"]
+        payment_metadata = {}
+        if ser.validated_data.get("upi_id"):
+            payment_metadata["upi_id"] = ser.validated_data["upi_id"]
+        if ser.validated_data.get("card_last4"):
+            payment_metadata["card_last4"] = ser.validated_data["card_last4"]
+        if ser.validated_data.get("bank_code"):
+            payment_metadata["bank_code"] = ser.validated_data["bank_code"]
+        if ser.validated_data.get("wallet_type"):
+            payment_metadata["wallet_type"] = ser.validated_data["wallet_type"]
+
+        try:
+            payment = booking.payment
+        except Payment.DoesNotExist:
+            payment = None
+        if not payment:
+            payment = Payment.objects.create(
+                booking=booking,
+                amount=booking.doctor.consultation_fee,
+                currency="INR",
+                payment_method=payment_method,
+                payment_status="pending",
+                payment_metadata=payment_metadata,
+            )
+        else:
+            payment.payment_method = payment_method
+            payment.payment_metadata = {**payment.payment_metadata, **payment_metadata}
+            payment.save(update_fields=["payment_method", "payment_metadata"])
+
+        # Dummy transaction id for frontend to show and send back on confirm
+        import uuid
+        order_id = f"NIVARA_{booking.id}_{uuid.uuid4().hex[:8].upper()}"
+        return Response({
+            "message": "Payment initiated (dummy gateway). Use confirm endpoint with transaction_id.",
+            "payment_id": payment.id,
+            "order_id": order_id,
+            "amount": str(payment.amount),
+            "currency": payment.currency,
+            "payment_method": payment.payment_method,
+        })
+
+
+class PaymentConfirmView(APIView):
+    """Confirm payment (dummy: marks payment completed and booking confirmed)."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, booking_id):
+        try:
+            booking = DoctorConsultationBooking.objects.get(id=booking_id, user=request.user)
+        except DoctorConsultationBooking.DoesNotExist:
+            return Response({"error": "Booking not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            payment = booking.payment
+        except Payment.DoesNotExist:
+            return Response({"error": "No payment record for this booking."}, status=status.HTTP_400_BAD_REQUEST)
+
+        if payment.payment_status == "completed":
+            return Response({
+                "message": "Payment already completed.",
+                "booking": DoctorConsultationBookingSerializer(booking).data,
+            })
+
+        ser = PaymentConfirmSerializer(data=request.data)
+        if not ser.is_valid():
+            return Response(ser.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        payment.transaction_id = ser.validated_data["transaction_id"]
+        payment.payment_status = "completed"
+        payment.paid_at = timezone.now()
+        meta = dict(payment.payment_metadata or {})
+        if ser.validated_data.get("upi_id"):
+            meta["upi_id"] = ser.validated_data["upi_id"]
+        if ser.validated_data.get("card_last4"):
+            meta["card_last4"] = ser.validated_data["card_last4"]
+        if ser.validated_data.get("bank_name"):
+            meta["bank_name"] = ser.validated_data["bank_name"]
+        payment.payment_metadata = meta
+        payment.save(update_fields=["transaction_id", "payment_status", "paid_at", "payment_metadata"])
+
+        booking.status = "confirmed"
+        booking.save(update_fields=["status"])
+
+        return Response({
+            "message": "Payment successful. Your consultation is confirmed.",
+            "booking": DoctorConsultationBookingSerializer(booking).data,
+            "payment": PaymentSerializer(payment).data,
+        })
