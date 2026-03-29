@@ -1,6 +1,6 @@
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
-from .models import MoodEntry, CycleEntry, CycleProfile, PeriodLog, DailyCheckin
+from .models import MoodEntry, CycleEntry, CycleProfile, PeriodLog, DailyCheckin, Hospital, Doctor, DoctorConsultationBooking, Payment
 
 User = get_user_model()
 
@@ -395,3 +395,106 @@ class CycleDashboardSerializer(serializers.Serializer):
     recent_checkin = serializers.DictField()
     personalized_insights = serializers.DictField()
     irregularity_analysis = serializers.DictField(allow_null=True)
+
+
+# =========================================================
+# 🏥 PHASE 7: DOCTOR CONSULTATION SERIALIZERS
+# =========================================================
+
+class HospitalSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Hospital
+        fields = [
+            'id', 'name', 'address', 'city', 'state', 'pincode',
+            'phone', 'email', 'website', 'is_active', 'created_at'
+        ]
+        read_only_fields = ['id', 'created_at']
+
+
+class DoctorSerializer(serializers.ModelSerializer):
+    hospital_name = serializers.CharField(source='hospital.name', read_only=True)
+    hospital_city = serializers.CharField(source='hospital.city', read_only=True)
+    specialization_display = serializers.CharField(source='get_specialization_display', read_only=True)
+
+    class Meta:
+        model = Doctor
+        fields = [
+            'id', 'hospital', 'hospital_name', 'hospital_city', 'name', 'specialization',
+            'specialization_display', 'qualification', 'consultation_fee', 'years_experience',
+            'available_days', 'bio', 'is_active', 'created_at'
+        ]
+        read_only_fields = ['id', 'created_at']
+
+
+class DoctorListSerializer(serializers.ModelSerializer):
+    """Lightweight for list views."""
+    hospital_name = serializers.CharField(source='hospital.name', read_only=True)
+    hospital_city = serializers.CharField(source='hospital.city', read_only=True)
+    specialization_display = serializers.CharField(source='get_specialization_display', read_only=True)
+
+    class Meta:
+        model = Doctor
+        fields = [
+            'id', 'hospital', 'hospital_name', 'hospital_city', 'name', 'specialization',
+            'specialization_display', 'qualification', 'consultation_fee', 'years_experience',
+            'available_days', 'is_active'
+        ]
+
+
+class PaymentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Payment
+        fields = [
+            'id', 'booking', 'amount', 'currency', 'payment_method', 'payment_status',
+            'transaction_id', 'payment_metadata', 'paid_at', 'created_at'
+        ]
+        read_only_fields = ['id', 'created_at']
+
+
+class DoctorConsultationBookingSerializer(serializers.ModelSerializer):
+    doctor_detail = DoctorListSerializer(source='doctor', read_only=True)
+    payment_detail = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DoctorConsultationBooking
+        fields = [
+            'id', 'user', 'doctor', 'doctor_detail', 'scheduled_at', 'status',
+            'consultation_type', 'report_shared', 'report_snapshot', 'notes',
+            'payment_detail', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'user', 'created_at', 'updated_at']
+
+    def get_payment_detail(self, obj):
+        try:
+            return PaymentSerializer(obj.payment).data
+        except Payment.DoesNotExist:
+            return None
+
+
+class DoctorConsultationBookingCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = DoctorConsultationBooking
+        fields = ['doctor', 'scheduled_at', 'consultation_type', 'report_shared', 'notes']
+
+    def validate_scheduled_at(self, value):
+        from django.utils import timezone
+        if value and value <= timezone.now():
+            raise serializers.ValidationError("Scheduled time must be in the future.")
+        return value
+
+
+class PaymentInitiateSerializer(serializers.Serializer):
+    payment_method = serializers.ChoiceField(choices=Payment.PAYMENT_METHOD_CHOICES)
+    # Optional: for UPI - upi_id; for card - last4; for net_banking - bank_code
+    upi_id = serializers.CharField(required=False, allow_blank=True)
+    card_last4 = serializers.CharField(required=False, allow_blank=True, max_length=4)
+    bank_code = serializers.CharField(required=False, allow_blank=True)
+    wallet_type = serializers.CharField(required=False, allow_blank=True)
+
+
+class PaymentConfirmSerializer(serializers.Serializer):
+    transaction_id = serializers.CharField()
+    # Optional metadata to store
+    upi_id = serializers.CharField(required=False, allow_blank=True)
+    card_last4 = serializers.CharField(required=False, allow_blank=True, max_length=4)
+    bank_name = serializers.CharField(required=False, allow_blank=True)
