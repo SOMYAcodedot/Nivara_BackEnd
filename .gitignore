@@ -8,6 +8,10 @@ env/
 db.sqlite3
 *.db
 *.sqlite3
+# SQLite WAL / journal sidecars (do not commit — recreated by SQLite)
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
 
 # Python
 __pycache__/
@@ -36,6 +40,7 @@ wheels/
 local_settings.py
 /media
 /static
+# Environment / secrets — never commit real keys (copy to .env locally; see .env.example)
 .env
 .env.local
 .env.*.local
@@ -73,5 +78,4 @@ yarn-error.log
 # Misc
 *.bak
 *.tmp
-.env.example
 .venv

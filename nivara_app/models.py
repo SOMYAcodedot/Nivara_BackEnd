@@ -402,3 +402,170 @@ class DailyCheckin(models.Model):
     
     def __str__(self):
         return f"{self.user.username} - Checkin: {self.checkin_date}"
+
+
+# =========================================================
+# 🏥 PHASE 7: DOCTOR CONSULTATION LAYER
+# Connects AI Insight → Human Expertise
+# =========================================================
+
+class Hospital(models.Model):
+    """
+    Healthcare facility where doctors are associated.
+    """
+    name = models.CharField(max_length=200)
+    address = models.TextField()
+    city = models.CharField(max_length=100)
+    state = models.CharField(max_length=100)
+    pincode = models.CharField(max_length=10, blank=True, null=True)
+    phone = models.CharField(max_length=20, blank=True, null=True)
+    email = models.EmailField(blank=True, null=True)
+    website = models.URLField(blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "hospitals"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+
+class Doctor(models.Model):
+    """
+    Healthcare professional for women's health (gynecologist, etc.).
+    """
+    SPECIALIZATION_CHOICES = [
+        ('gynecology', 'Gynecology'),
+        ('obstetrics', 'Obstetrics'),
+        ('reproductive_endocrinology', 'Reproductive Endocrinology'),
+        ('womens_health', "Women's Health & Wellness"),
+        ('fertility', 'Fertility Specialist'),
+        ('pcos', 'PCOS & Hormonal Health'),
+        ('menopause', 'Menopause Care'),
+    ]
+
+    hospital = models.ForeignKey(Hospital, on_delete=models.CASCADE, related_name="doctors")
+    name = models.CharField(max_length=150)
+    specialization = models.CharField(max_length=50, choices=SPECIALIZATION_CHOICES)
+    qualification = models.CharField(max_length=200)  # e.g. "MBBS, MD - Obstetrics & Gynecology"
+    consultation_fee = models.DecimalField(max_digits=10, decimal_places=2)
+    years_experience = models.PositiveIntegerField(default=5, blank=True, null=True)
+    available_days = models.JSONField(default=list, blank=True)  # e.g. ["mon", "wed", "fri"]
+    bio = models.TextField(blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "doctors"
+        ordering = ["name"]
+
+    def __str__(self):
+        return f"Dr. {self.name} ({self.get_specialization_display()})"
+
+
+class DoctorConsultationBooking(models.Model):
+    """
+    Booking for virtual or in-person consultation with a doctor.
+    Can optionally attach AI-generated health report for doctor review.
+    """
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('payment_pending', 'Payment Pending'),
+        ('confirmed', 'Confirmed'),
+        ('completed', 'Completed'),
+        ('cancelled', 'Cancelled'),
+    ]
+    CONSULTATION_TYPE_CHOICES = [
+        ('virtual', 'Virtual Consultation'),
+        ('in_person', 'In-Person Visit'),
+    ]
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="doctor_bookings")
+    doctor = models.ForeignKey(Doctor, on_delete=models.CASCADE, related_name="bookings")
+    scheduled_at = models.DateTimeField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    consultation_type = models.CharField(max_length=20, choices=CONSULTATION_TYPE_CHOICES, default='virtual')
+    report_shared = models.BooleanField(default=False)
+    report_snapshot = models.JSONField(blank=True, null=True)  # AI health report when shared
+    notes = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "doctor_consultation_bookings"
+        ordering = ["-scheduled_at"]
+
+    def __str__(self):
+        return f"{self.user.username} - Dr. {self.doctor.name} @ {self.scheduled_at}"
+
+
+class Payment(models.Model):
+    """
+    Payment record for doctor consultation (dummy gateway: UPI, card, net banking, wallet).
+    """
+    PAYMENT_METHOD_CHOICES = [
+        ('pending', 'Pending'),
+        ('upi', 'UPI'),
+        ('debit_card', 'Debit Card'),
+        ('credit_card', 'Credit Card'),
+        ('net_banking', 'Net Banking'),
+        ('wallet', 'Wallet'),
+    ]
+    PAYMENT_STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+        ('refunded', 'Refunded'),
+    ]
+
+    booking = models.OneToOneField(DoctorConsultationBooking, on_delete=models.CASCADE, related_name="payment")
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    currency = models.CharField(max_length=3, default='INR')
+    payment_method = models.CharField(max_length=20, choices=PAYMENT_METHOD_CHOICES)
+    payment_status = models.CharField(max_length=20, choices=PAYMENT_STATUS_CHOICES, default='pending')
+    transaction_id = models.CharField(max_length=100, blank=True, null=True)  # Dummy gateway ref
+    # Optional metadata: upi_id, card_last4, bank_name, etc.
+    payment_metadata = models.JSONField(default=dict, blank=True)
+    paid_at = models.DateTimeField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "payments"
+
+    def __str__(self):
+        return f"Payment {self.id} - {self.amount} {self.currency} ({self.payment_status})"
+
+
+# =========================================================
+# 💬 CHAT SESSIONS (persisted conversations – one Azure call per message)
+# =========================================================
+
+class ChatSession(models.Model):
+    """A conversation thread for the Nivara chatbot (logged-in users)."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="chat_sessions")
+    title = models.CharField(max_length=200, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "chat_sessions"
+        ordering = ["-updated_at"]
+
+    def __str__(self):
+        return f"{self.user.username} - session {self.id}"
+
+
+class ChatMessage(models.Model):
+    """Single message in a session (user or assistant)."""
+    ROLE_CHOICES = [("user", "User"), ("assistant", "Assistant")]
+
+    session = models.ForeignKey(ChatSession, on_delete=models.CASCADE, related_name="messages")
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES)
+    content = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "chat_messages"
+        ordering = ["created_at", "id"]

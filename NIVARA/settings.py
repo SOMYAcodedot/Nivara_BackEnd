@@ -13,9 +13,15 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 from pathlib import Path
 from datetime import timedelta
 
-
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Load .env from project root so Azure vars are set before generic_chat imports.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(BASE_DIR / ".env")
+except Exception:
+    pass
 
 
 # Quick-start development settings - unsuitable for production
@@ -27,7 +33,7 @@ SECRET_KEY = "django-insecure-d1(%o4&!fe)gperx4%7$7ki&-!u_z6)+0p%vt6u&f_!igrz(&%
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ["localhost", "127.0.0.1", "testserver"]
 
 
 # Application definition
@@ -52,6 +58,8 @@ INSTALLED_APPS = [
 
 
 MIDDLEWARE = [
+    # SQLite: one request at a time — stops "database is locked" (login + chat + JWT blacklist)
+    "nivara_app.middleware.sqlite_serialize.SqliteSerializeRequestsMiddleware",
     'corsheaders.middleware.CorsMiddleware',  # ADD THIS FIRST
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -91,8 +99,28 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": BASE_DIR / "db.sqlite3",
+        "CONN_MAX_AGE": 0,  # close after each request — fewer stuck locks on Windows
+        "OPTIONS": {
+            "timeout": 60,
+        },
     }
 }
+
+
+def _sqlite_concurrency(sender, connection, **kwargs):
+    if connection.vendor != "sqlite":
+        return
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA busy_timeout=30000;")
+    except Exception:
+        pass
+
+
+from django.db.backends.signals import connection_created
+
+connection_created.connect(_sqlite_concurrency)
 
 
 # Password validation
@@ -134,6 +162,14 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.1/howto/static-files/
 
 STATIC_URL = "static/"
+
+# In-memory cache for LLM bundles (lifestyle + report share one call per user/window)
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "nivara-default",
+    }
+}
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field

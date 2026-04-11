@@ -17,9 +17,13 @@ Including another URLconf
 
 from django.contrib import admin
 from django.urls import path, include
+from nivara_app.views import health_summary_report, health_summary_export
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    # Phase 6: AI Health Report – explicit routes (matched first so /api/report/summary/ always works)
+    path('api/report/summary/', health_summary_report),
+    path('api/report/summary/export/', health_summary_export),
     path('api/', include('nivara_app.urls')),
 ]
 
