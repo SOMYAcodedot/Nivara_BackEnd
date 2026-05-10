@@ -109,6 +109,10 @@ class MoodEntry(models.Model):
     mood_text = models.TextField(blank=True, null=True)
     mood_rating = models.IntegerField(null=True, blank=True)  # Legacy 1-5 scale
 
+    # Assessment-based mood logging (Phase 8)
+    question_responses = models.JSONField(blank=True, null=True)  # Raw answers from questionnaire
+    is_assessment_based = models.BooleanField(default=False)  # True if derived from questions
+
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

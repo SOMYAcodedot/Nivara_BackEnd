@@ -135,7 +135,7 @@ class UserProfileBasicSerializer(serializers.ModelSerializer):
 class MoodEntrySerializer(serializers.ModelSerializer):
     class Meta:
         model = MoodEntry
-        fields = ['id', 'mood_score', 'emotion_type', 'journal_text', 'entry_date', 'created_at']
+        fields = ['id', 'mood_score', 'emotion_type', 'journal_text', 'entry_date', 'is_assessment_based', 'created_at']
         read_only_fields = ['id', 'created_at']
 
     def validate_mood_score(self, value):
@@ -150,6 +150,31 @@ class MoodEntryDetailSerializer(serializers.ModelSerializer):
         model = MoodEntry
         fields = '__all__'
         read_only_fields = ['id', 'user', 'created_at']
+
+
+# ✅ Mood Assessment Serializer (Phase 8 - Question-based mood logging)
+class MoodAssessmentSerializer(serializers.Serializer):
+    """
+    Accepts answers to 8 mood assessment questions (each scored 1-5)
+    and an optional journal note and entry date.
+    """
+    VALID_QUESTION_IDS = ['q1', 'q2', 'q3', 'q4', 'q5', 'q6', 'q7', 'q8']
+
+    answers = serializers.DictField(
+        child=serializers.IntegerField(min_value=1, max_value=5),
+        help_text="Dict of question_id → score (1-5) for all 8 questions"
+    )
+    journal_text = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    entry_date = serializers.DateField(required=False)
+
+    def validate_answers(self, value):
+        missing = [q for q in self.VALID_QUESTION_IDS if q not in value]
+        if missing:
+            raise serializers.ValidationError(f"Missing answers for questions: {missing}")
+        extra = [k for k in value if k not in self.VALID_QUESTION_IDS]
+        if extra:
+            raise serializers.ValidationError(f"Unknown question keys: {extra}")
+        return value
 
 
 # ✅ Cycle Entry Serializer (Legacy)

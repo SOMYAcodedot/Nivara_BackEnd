@@ -9,6 +9,9 @@ from .views import (
     log_mood,
     mood_history,
     run_mood_analysis,
+    # Phase 8: Question-based mood assessment
+    mood_questions,
+    mood_assess,
     # Phase 2: Mood Analytics APIs
     mood_trend_data,
     emotion_distribution,
@@ -80,6 +83,12 @@ urlpatterns = [
     path("mood/log/", log_mood, name="log_mood"),
     path("mood/history/", mood_history, name="mood_history"),
     path("mood/analysis/", run_mood_analysis, name="mood_analysis"),
+
+    # ===============================
+    # 🧠 PHASE 8: MOOD ASSESSMENT (Question-based)
+    # ===============================
+    path("mood/questions/", mood_questions, name="mood_questions"),
+    path("mood/assess/", mood_assess, name="mood_assess"),
 
     # ===============================
     # 📊 PHASE 2: MOOD ANALYTICS (Graphical Data)

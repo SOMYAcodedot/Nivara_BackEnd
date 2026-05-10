@@ -30,8 +30,9 @@ from .models import (
     ChatMessage,
 )
 from .serializers import (
-    MoodEntrySerializer, 
-    MoodEntryDetailSerializer, 
+    MoodEntrySerializer,
+    MoodEntryDetailSerializer,
+    MoodAssessmentSerializer,
     CycleEntrySerializer,
     CycleProfileSerializer,
     CycleProfileCreateSerializer,
@@ -279,6 +280,253 @@ def mood_history(request):
     moods = MoodEntry.objects.filter(user=request.user).order_by("-created_at")
     serializer = MoodEntrySerializer(moods, many=True)
     return Response(serializer.data)
+
+
+# =========================================================
+# 🧠 PHASE 8: QUESTION-BASED MOOD ASSESSMENT
+# =========================================================
+
+# Static questionnaire returned to the frontend
+MOOD_ASSESSMENT_QUESTIONS = [
+    {
+        "id": "q1",
+        "text": "How energetic do you feel today?",
+        "category": "energy",
+        "options": [
+            {"value": 1, "label": "Completely drained"},
+            {"value": 2, "label": "Low energy"},
+            {"value": 3, "label": "Moderate"},
+            {"value": 4, "label": "Energetic"},
+            {"value": 5, "label": "Very energetic"},
+        ],
+    },
+    {
+        "id": "q2",
+        "text": "How much are you feeling anxious or worried?",
+        "category": "anxiety",
+        "options": [
+            {"value": 1, "label": "Not at all"},
+            {"value": 2, "label": "Slightly"},
+            {"value": 3, "label": "Somewhat"},
+            {"value": 4, "label": "Quite a bit"},
+            {"value": 5, "label": "Very much"},
+        ],
+    },
+    {
+        "id": "q3",
+        "text": "How do you feel about being around people today?",
+        "category": "social",
+        "options": [
+            {"value": 1, "label": "Want to be completely alone"},
+            {"value": 2, "label": "Prefer some space"},
+            {"value": 3, "label": "Neutral"},
+            {"value": 4, "label": "Like some company"},
+            {"value": 5, "label": "Very sociable"},
+        ],
+    },
+    {
+        "id": "q4",
+        "text": "How well did you sleep last night?",
+        "category": "sleep",
+        "options": [
+            {"value": 1, "label": "Very poorly"},
+            {"value": 2, "label": "Poorly"},
+            {"value": 3, "label": "Fairly well"},
+            {"value": 4, "label": "Well"},
+            {"value": 5, "label": "Very well"},
+        ],
+    },
+    {
+        "id": "q5",
+        "text": "How motivated do you feel to handle your day?",
+        "category": "motivation",
+        "options": [
+            {"value": 1, "label": "Not at all motivated"},
+            {"value": 2, "label": "Slightly motivated"},
+            {"value": 3, "label": "Somewhat motivated"},
+            {"value": 4, "label": "Quite motivated"},
+            {"value": 5, "label": "Highly motivated"},
+        ],
+    },
+    {
+        "id": "q6",
+        "text": "How sad or low have you been feeling?",
+        "category": "sadness",
+        "options": [
+            {"value": 1, "label": "Not at all"},
+            {"value": 2, "label": "A little"},
+            {"value": 3, "label": "Moderately"},
+            {"value": 4, "label": "Quite sad"},
+            {"value": 5, "label": "Very sad"},
+        ],
+    },
+    {
+        "id": "q7",
+        "text": "How stressed or overwhelmed are you feeling?",
+        "category": "stress",
+        "options": [
+            {"value": 1, "label": "Not at all"},
+            {"value": 2, "label": "Slightly"},
+            {"value": 3, "label": "Moderately"},
+            {"value": 4, "label": "Quite stressed"},
+            {"value": 5, "label": "Extremely stressed"},
+        ],
+    },
+    {
+        "id": "q8",
+        "text": "How positive or hopeful do you feel about things?",
+        "category": "positivity",
+        "options": [
+            {"value": 1, "label": "Not at all positive"},
+            {"value": 2, "label": "Slightly positive"},
+            {"value": 3, "label": "Somewhat positive"},
+            {"value": 4, "label": "Quite positive"},
+            {"value": 5, "label": "Very positive"},
+        ],
+    },
+]
+
+
+def derive_mood_from_answers(answers):
+    """
+    Compute mood_score (1-10) and emotion_type from 8 questionnaire answers (each 1-5).
+
+    Positive questions (higher = better): q1, q3, q4, q5, q8
+    Negative questions (higher = worse):  q2, q6, q7
+    """
+    q1 = answers.get('q1', 3)  # energy
+    q2 = answers.get('q2', 2)  # anxiety
+    q3 = answers.get('q3', 3)  # social
+    q4 = answers.get('q4', 3)  # sleep
+    q5 = answers.get('q5', 3)  # motivation
+    q6 = answers.get('q6', 1)  # sadness
+    q7 = answers.get('q7', 2)  # stress
+    q8 = answers.get('q8', 3)  # positivity
+
+    positive_score = q1 + q3 + q4 + q5 + q8   # range 5-25
+    negative_score = q2 + q6 + q7               # range 3-15
+    net = positive_score - negative_score        # range -10 to 22
+
+    # Normalize net (-10…22) to mood_score (1…10)
+    mood_score = round(((net + 10) / 32) * 9) + 1
+    mood_score = max(1, min(10, mood_score))
+
+    # Emotion priority ladder
+    if q6 >= 4 and (q1 <= 2 or negative_score >= 9):
+        emotion = 'sad'
+    elif q2 >= 4 and q7 >= 3:
+        emotion = 'anxious'
+    elif q7 >= 4 and (q1 <= 2 or q5 <= 2):
+        emotion = 'overwhelmed'
+    elif q7 >= 3 and negative_score >= 9:
+        emotion = 'stressed'
+    elif q1 <= 2 and q5 <= 2 and q4 <= 2:
+        emotion = 'tired'
+    elif q8 >= 4 and q1 >= 4 and positive_score >= 20 and negative_score <= 5:
+        emotion = 'excited'
+    elif positive_score >= 20 and negative_score <= 6:
+        emotion = 'happy'
+    elif positive_score >= 17 and negative_score <= 8:
+        emotion = 'content'
+    elif q8 >= 3 and negative_score <= 6 and positive_score >= 14:
+        emotion = 'hopeful'
+    elif positive_score >= 12 and negative_score <= 8:
+        emotion = 'calm'
+    else:
+        emotion = 'neutral'
+
+    def _level(score, low=2, high=3):
+        if score <= low:
+            return 'low'
+        if score >= high:
+            return 'high'
+        return 'moderate'
+
+    return {
+        'mood_score': mood_score,
+        'emotion_type': emotion,
+        'positive_score': positive_score,
+        'negative_score': negative_score,
+        'energy_level': _level(q1),
+        'stress_level': _level(q7),
+        'anxiety_level': _level(q2),
+        'sleep_quality': _level(q4),
+    }
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def mood_questions(request):
+    """
+    GET /api/mood/questions/
+    Returns the full list of mood assessment questions with options.
+    Frontend renders these as a step-by-step questionnaire.
+    """
+    return Response({
+        "total_questions": len(MOOD_ASSESSMENT_QUESTIONS),
+        "instructions": "Answer each question honestly on a scale of 1-5. Your responses will help us understand your emotional state accurately.",
+        "questions": MOOD_ASSESSMENT_QUESTIONS,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def mood_assess(request):
+    """
+    POST /api/mood/assess/
+    Submit questionnaire answers; backend derives emotion_type and mood_score,
+    saves a MoodEntry, and returns the result.
+
+    Body:
+    {
+        "answers": {"q1": 4, "q2": 2, "q3": 3, "q4": 4, "q5": 4, "q6": 1, "q7": 2, "q8": 3},
+        "journal_text": "optional note",   // optional
+        "entry_date": "2026-05-02"          // optional, defaults to today
+    }
+    """
+    serializer = MoodAssessmentSerializer(data=request.data)
+    if not serializer.is_valid():
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    validated = serializer.validated_data
+    answers = validated['answers']
+    journal_text = validated.get('journal_text', '')
+    entry_date = validated.get('entry_date', date.today())
+
+    # Derive emotion and score from answers
+    assessment_result = derive_mood_from_answers(answers)
+
+    # Save MoodEntry
+    mood_entry = MoodEntry.objects.create(
+        user=request.user,
+        mood_score=assessment_result['mood_score'],
+        emotion_type=assessment_result['emotion_type'],
+        journal_text=journal_text or None,
+        entry_date=entry_date,
+        question_responses=answers,
+        is_assessment_based=True,
+    )
+
+    return Response({
+        "mood_entry": {
+            "id": mood_entry.id,
+            "mood_score": mood_entry.mood_score,
+            "emotion_type": mood_entry.emotion_type,
+            "emotion_label": mood_entry.get_emotion_type_display(),
+            "journal_text": mood_entry.journal_text,
+            "entry_date": str(mood_entry.entry_date),
+            "is_assessment_based": True,
+            "created_at": mood_entry.created_at.isoformat(),
+        },
+        "assessment_breakdown": {
+            "positive_score": assessment_result['positive_score'],
+            "negative_score": assessment_result['negative_score'],
+            "energy_level": assessment_result['energy_level'],
+            "stress_level": assessment_result['stress_level'],
+            "anxiety_level": assessment_result['anxiety_level'],
+            "sleep_quality": assessment_result['sleep_quality'],
+        },
+    }, status=status.HTTP_201_CREATED)
 
 
 # =========================================================
